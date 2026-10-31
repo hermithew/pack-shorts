@@ -2,6 +2,7 @@
 // receive frames in presentation order, pick the source frame nearest to each wanted time (like ffmpeg's
 // fps filter), draw only the frames that are needed and close every VideoFrame immediately.
 import { openMp4, keyframeBefore } from './demux.js';
+import { canConvert, frameToImageData } from './yuv.js';
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const abortErr = signal => signal?.reason ?? new DOMException('Aborted', 'AbortError');
@@ -122,7 +123,7 @@ export async function decodeVideo(file, { timeAt, k0 = 0, kEnd, onFrame, busy, s
  * Only the selected frames are drawn (at the requested size); at most ~3 bitmaps are buffered.
  * @param {Blob} file
  * @param {{fps?:number, width?:number, height?:number, fit?:'pad'|'crop', startAt?:number, signal?:AbortSignal}} [opts]
- * @yields {{t:number, bitmap:ImageBitmap}} caller owns (and should close) each bitmap
+ * @yields {{t:number, bitmap:ImageData}} upright RGBA pixels (field kept as "bitmap" for compatibility; ImageData has no close())
  */
 export async function* sampleFrames(file, { fps = 6, width = 720, height = 1280, fit = 'pad', startAt = 0, signal } = {}) {
   const info = await openMp4(file);
@@ -131,7 +132,11 @@ export async function* sampleFrames(file, { fps = 6, width = 720, height = 1280,
   const k0 = Math.max(0, Math.ceil(startAt * fps - 1e-6));
   const kEnd = Math.max(k0, Math.round(dur * fps));
   const canvas = makeCanvas(width, height);
-  const ctx = canvas.getContext('2d', { alpha: false });
+  // willReadFrequently keeps this canvas in plain memory. Frames are handed out as ImageData (a normal
+  // ArrayBuffer the garbage collector frees, and transferable to a worker). transferToImageBitmap() looked
+  // cheaper but on Chromium its per-frame backing memory wasn't released even after bitmap.close():
+  // ~3.7 MB per sampled frame, which crashed phones about 40 s into a video.
+  const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
   const queue = [];
   let done = false, failure = null, stopped = false, wake = null;
   const notify = () => { if (wake) { const w = wake; wake = null; w(); } };
@@ -140,21 +145,34 @@ export async function* sampleFrames(file, { fps = 6, width = 720, height = 1280,
   signal?.addEventListener('abort', onAbort, { once: true });
   if (signal?.aborted) onAbort();
 
+  // Pixels are copied straight out of the decoder (yuv.js) - no canvas, so no browser-cache build-up.
+  // Each queue entry holds a promise so frames stay in order while conversions run.
+  let copyOK = null;                     // null = untested, true/false after the first frame
+  const convert = async (f) => {
+    try {
+      if (copyOK !== false && canConvert(f)) {
+        try { const img = await frameToImageData(f, new ImageData(width, height), info.rotation, fit); copyOK = true; return img; }
+        catch (e) { if (copyOK) throw e; copyOK = false; console.warn('direct frame copy unavailable, using canvas', e); }
+      }
+      drawUpright(ctx, f, info.rotation, width, height, fit);
+      return ctx.getImageData(0, 0, width, height);
+    } finally { f.close(); }
+  };
   const job = decodeVideo(file, {
     info, k0, kEnd, timeAt: k => k / fps, signal: inner.signal,
     busy: () => queue.length >= 3 && !stopped,
     onFrame: (frame, t) => {
       if (stopped) return;
-      drawUpright(ctx, frame, info.rotation, width, height, fit);
-      const bitmap = canvas.transferToImageBitmap ? canvas.transferToImageBitmap() : null;
-      queue.push({ t, bitmap: bitmap || ctx.getImageData(0, 0, width, height) });
+      const p = convert(frame.clone());
+      p.catch(() => {});                 // surfaced when the entry is consumed
+      queue.push({ t, p });
       notify();
     },
   }).then(() => { done = true; notify(); }, e => { failure = e; done = true; notify(); });
 
   try {
     while (true) {
-      if (queue.length) { yield queue.shift(); continue; }
+      if (queue.length) { const e = queue[0]; const bitmap = await e.p; queue.shift(); notify(); yield { t: e.t, bitmap }; continue; }
       if (failure) throw failure;
       if (done) break;
       await new Promise(r => { wake = r; });
@@ -163,7 +181,7 @@ export async function* sampleFrames(file, { fps = 6, width = 720, height = 1280,
     stopped = true;
     if (!done) inner.abort(new DOMException('Stopped', 'AbortError'));
     await job;
-    for (const q of queue) q.bitmap?.close?.();
+    for (const q of queue) q.p?.catch(() => {});
     queue.length = 0;
     signal?.removeEventListener('abort', onAbort);
   }

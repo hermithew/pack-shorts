@@ -771,7 +771,9 @@ async function runScan() {
     if (s.voice) {
       where = 'voice';
       prog.stage('voice', 'the first time, this downloads the speech model (about 80–150 MB)');
-      const heard = await voice.listen(file, fullPool, { onProgress: prog.cb, signal });
+      let heard;
+      try { heard = await voice.listen(file, fullPool, { onProgress: prog.cb, signal }); }
+      finally { try { voice.disposeVoice?.(); } catch (_) { /* ignore */ } }   // free the speech model before card finding
       checkAbort(signal);
       hits = heard?.hits || [];
       const names = new Set(hits.map((h) => h.name));
@@ -801,10 +803,13 @@ async function runScan() {
 
     where = 'detect';
     prog.stage('detect', '');
-    let events = await detect.detectCards(file, artPool, {
-      skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal,
-      ...(nArt > ONE_WORKER_ART ? { workers: 1 } : {}),     // don't hold a big index twice
-    });
+    let events;
+    try {
+      events = await detect.detectCards(file, artPool, {
+        skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal,
+        ...(nArt > ONE_WORKER_ART ? { workers: 1 } : {}),     // don't hold a big index twice
+      });
+    } finally { try { detect.disposeDetector?.(); } catch (_) { /* ignore */ } }   // free OpenCV before the next step
     checkAbort(signal);
 
     if (s.voice) {

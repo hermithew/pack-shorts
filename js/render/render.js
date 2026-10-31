@@ -4,6 +4,7 @@
 // Port of render() / build_audio() in the original Python version. Runs in a module Worker when possible.
 import { openMp4 } from '../media/demux.js';
 import { decodeVideo, drawUpright } from '../media/frames.js';
+import { canConvert, frameToImageData } from '../media/yuv.js';
 import { decodeAudioPCM } from '../media/audio.js';
 import { buildTimeline, drawOverlays, OUT_W, OUT_H } from './painter.js';
 import { synthSfx } from './sfx.js';
@@ -308,17 +309,46 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
   const frameDur = Math.round(1e6 / fps);
   let frames = 0, lastReport = 0;
   const tv0 = performance.now();
+  // Frames are copied straight out of the decoder and converted in JS (media/yuv.js), then put on the canvas.
+  // Drawing VideoFrames with drawImage kept ~5 MB per frame in browser caches and crashed phones.
+  const img = new ImageData(OUT_W, OUT_H);
+  let copyOK = null, chain = Promise.resolve(), pend = 0;
+  const paint = async (f) => {
+    if (copyOK !== false && canConvert(f)) {
+      try { await frameToImageData(f, img, info.rotation, fit); ctx.putImageData(img, 0, 0); copyOK = true; return; }
+      catch (e) { if (copyOK) throw e; copyOK = false; console.warn('direct frame copy unavailable, using canvas', e); }
+    }
+    drawUpright(ctx, f, info.rotation, OUT_W, OUT_H, fit);
+  };
   try {
     report('video', 0.1, 'Rendering…');
     await decodeVideo(file, {
       info, k0: 0, kEnd: N, timeAt: k => k / fps, signal,
       busy: () => {
         if (error) throw error;
-        return venc.encodeQueueSize > 6 || (aenc && aenc.encodeQueueSize > 24);
+        return pend > 2 || venc.encodeQueueSize > 6 || (aenc && aenc.encodeQueueSize > 24);
       },
-      onFrame: (frame, t, k) => {
+      onFrame: (frame0, t, k) => {
         if (error) throw error;
-        drawUpright(ctx, frame, info.rotation, OUT_W, OUT_H, fit);
+        const f = frame0.clone(); pend++;
+        chain = chain.then(() => drawAndEncode(f, t, k)).catch(e => { error = error || e; }).finally(() => { f.close(); pend--; });
+      },
+    });
+    await chain;
+    check();
+    feedAudio(outDur + 1);
+    report('finish', 0.97, 'Finishing…');
+    await venc.flush();
+    if (aenc) await aenc.flush();
+    if (error) throw error;
+    muxer.finalize();
+  } finally {
+    for (const e of [venc, aenc]) if (e && e.state !== 'closed') try { e.close(); } catch (_) {}
+    mix = null;
+  }
+  async function drawAndEncode(frame, t, k) {
+        if (error) throw error;
+        await paint(frame);
         drawOverlays(ctx, t, tl);
         const vf = new VideoFrame(canvas, { timestamp: k * frameDur, duration: frameDur });
         venc.encode(vf, { keyFrame: k % keyEvery === 0 });
@@ -331,18 +361,6 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
           const rate = frames / ((now - tv0) / 1000);
           report('video', 0.1 + 0.87 * (k + 1) / N, `Rendering ${(t).toFixed(1)} s / ${outDur.toFixed(1)} s (${rate.toFixed(1)} fps)`);
         }
-      },
-    });
-    check();
-    feedAudio(outDur + 1);
-    report('finish', 0.97, 'Finishing…');
-    await venc.flush();
-    if (aenc) await aenc.flush();
-    if (error) throw error;
-    muxer.finalize();
-  } finally {
-    for (const e of [venc, aenc]) if (e && e.state !== 'closed') try { e.close(); } catch (_) {}
-    mix = null;
   }
   const mimeType = container === 'mp4' ? 'video/mp4' : 'video/webm';
   const blob = sink.toBlob(mimeType);
