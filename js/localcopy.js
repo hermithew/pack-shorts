@@ -61,13 +61,15 @@ export async function clearStaged(keepName = null, keepSize = null) {
   } catch { /* ignore */ }
 }
 
-function friendlyReadError() {
+function friendlyReadError(detail = '') {
   const e = new Error('Your phone stopped letting the app read this video. If you picked it from Gallery or Photos, '
     + 'try picking it from the Files app (My Files → Videos or DCIM → Camera) instead, and keep the app open while it '
-    + 'copies. If the video is only in the cloud (e.g. Google Photos backup), download it to the phone first.');
+    + 'copies. If the video is only in the cloud (e.g. Google Photos backup), download it to the phone first.'
+    + (detail ? ` [${detail}]` : ''));
   e.name = 'VideoReadError';
   return e;
 }
+const errInfo = (e) => `${e?.name || 'Error'}${e?.message ? ': ' + String(e.message).slice(0, 80) : ''}`;
 
 async function readChunk(file, a, b) {
   let last;
@@ -76,7 +78,43 @@ async function readChunk(file, a, b) {
     catch (e) { last = e; await new Promise(r => setTimeout(r, 300 * (attempt + 1))); }
   }
   console.warn('video read failed at', a, last);
-  throw friendlyReadError();
+  throw friendlyReadError(`slice at ${(a / 1048576).toFixed(0)} MB · ${errInfo(last)}`);
+}
+
+/**
+ * Read the whole file front to back as one stream, handing out ~8 MB pieces.
+ * Some Android pickers only allow reading a picked video straight through (no jumping to an offset),
+ * which is exactly what a stream does.
+ */
+async function* streamPieces(file, signal) {
+  const reader = file.stream().getReader();
+  let parts = [], have = 0, at = 0;
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+      let r;
+      try { r = await reader.read(); }
+      catch (e) { e.at = at + have; throw e; }
+      if (r.done) break;
+      parts.push(r.value); have += r.value.byteLength;
+      if (have >= CHUNK) {
+        const buf = concat(parts, have); yield { at, buf }; at += have; parts = []; have = 0;
+      }
+    }
+    if (have) yield { at, buf: concat(parts, have) };
+  } finally { try { reader.releaseLock(); } catch { /* ignore */ } }
+}
+function concat(parts, total) {
+  if (parts.length === 1 && parts[0].byteOffset === 0 && parts[0].byteLength === parts[0].buffer.byteLength) return parts[0].buffer;
+  const out = new Uint8Array(total); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.byteLength; }
+  return out.buffer;
+}
+async function* slicePieces(file, signal) {
+  for (let at = 0; at < file.size; at += CHUNK) {
+    if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+    yield { at, buf: await readChunk(file, at, Math.min(file.size, at + CHUNK)) };
+  }
 }
 
 // Fallback writer for browsers without createWritable() on private files: a tiny worker using a sync access handle.
@@ -136,6 +174,30 @@ export async function stageVideo(file, { onProgress, signal } = {}) {
   } catch { /* ignore */ }
 
   const name = safeName(file.name, file.size);
+  // 1st try: one continuous stream (works when the phone forbids jumping around in the file).
+  // 2nd try: 8 MB slices (works when streams misbehave but random access is fine).
+  const methods = typeof file.stream === 'function' ? ['stream', 'slice'] : ['slice'];
+  let lastErr = null;
+  for (const method of methods) {
+    try {
+      await copyWith(method, file, dir, name, onProgress, signal);
+      const copy = await getStaged(file.name, file.size);
+      if (copy) { console.info('working copy made with', method); return { file: copy, staged: true, method }; }
+      lastErr = friendlyReadError(`${method}: copy incomplete`);
+    } catch (e) {
+      await dir.removeEntry(name).catch(() => {});
+      if (e?.name === 'AbortError') throw e;
+      if (e?.name === 'QuotaExceededError') return { file, staged: false, reason: 'space' };
+      console.warn(`copy with ${method} failed`, e);
+      lastErr = e?.name === 'VideoReadError' ? e
+        : friendlyReadError(`${method}${e?.at != null ? ` at ${(e.at / 1048576).toFixed(0)} MB` : ''} · ${errInfo(e)}`);
+      onProgress?.(0);
+    }
+  }
+  throw lastErr;
+}
+
+async function copyWith(method, file, dir, name, onProgress, signal) {
   const fh = await dir.getFileHandle(name, { create: true });
   let writer = null, ww = null;
   try {
@@ -143,22 +205,16 @@ export async function stageVideo(file, { onProgress, signal } = {}) {
       try { writer = await fh.createWritable({ keepExistingData: false }); } catch { writer = null; }
     }
     if (!writer) { ww = workerWriter(name); await ww.open(); }
-    for (let at = 0; at < file.size; at += CHUNK) {
-      if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
-      const buf = await readChunk(file, at, Math.min(file.size, at + CHUNK));
+    const pieces = method === 'stream' ? streamPieces(file, signal) : slicePieces(file, signal);
+    for await (const { at, buf } of pieces) {
       if (writer) await writer.write({ type: 'write', position: at, data: buf });
       else await ww.write(buf, at);
       onProgress?.(Math.min(1, (at + buf.byteLength) / file.size));
     }
     if (writer) await writer.close(); else await ww.close();
-  } catch (e) {
+    writer = null; ww = null;
+  } finally {
     try { if (writer) await writer.abort(); } catch { /* ignore */ }
     try { ww?.abort(); } catch { /* ignore */ }
-    await dir.removeEntry(name).catch(() => {});
-    if (e?.name === 'QuotaExceededError') return { file, staged: false, reason: 'space' };
-    throw e;
   }
-  const copy = await getStaged(file.name, file.size);
-  if (!copy) return { file, staged: false, reason: 'verify' };
-  return { file: copy, staged: true };
 }
