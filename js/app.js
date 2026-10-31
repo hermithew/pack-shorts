@@ -17,7 +17,12 @@ const MOCK = params.get('mock') === '1';
 // Cache Storage names owned by other modules (cleared from the Storage section on the home screen)
 export const ART_CACHE_PREFIX = 'pack-shorts-art';      // data.js card-art cache (e.g. 'pack-shorts-art-v1')
 export const MODEL_CACHE_NAME = 'transformers-cache';   // Transformers.js speech model cache
-const BIG_POOL = 600; // above this many card faces, voice also narrows the art search (same threshold as the original Python version)
+const BIG_POOL = 600;
+// Phones run out of memory matching against thousands of artworks (each worker holds ~35 KB per artwork,
+// plus the video decoder). Above MAX_ART we stop and suggest narrowing; above ONE_WORKER_ART we use one worker.
+const MAX_ART = 2000;
+const ONE_WORKER_ART = 800;
+const artCount = (pool) => new Set(pool.map((r) => r.illustration_id || r.art_key || r.id)).size; // above this many card faces, voice also narrows the art search (same threshold as the original Python version)
 
 const DEFAULT_SETTINGS = {
   sets: '', drop: '', voice: false, allowDupes: false, skipStart: 0, packPrice: null,
@@ -401,7 +406,10 @@ async function openJob(id) {
     // a scan/render that was running when the page closed can't be resumed
     if (!busy && (job.status === 'scanning' || job.status === 'rendering')) {
       job.status = job.cards?.length ? 'review' : 'new';
-      job.error = 'The last run was interrupted (the page was closed or reloaded). Run it again when you’re ready.';
+      job.error = 'The last run was interrupted (the page was closed, reloaded, or the browser ran out of memory). '
+        + (job.lastStep ? `It stopped at: “${job.lastStep}”. ` : '')
+        + 'If it keeps happening, use fewer or smaller sets, or turn on “Listen for card names I say”.';
+      job.lastStep = null;
       await saveJob();
     }
   }
@@ -742,9 +750,13 @@ async function runScan() {
     ? [['pool', 'Getting the card list', 6], ['voice', 'Listening for card names', 30], ['art', 'Downloading card pictures', 14], ['detect', 'Finding cards in the video', 48], ['merge', 'Matching what you said', 2]]
     : [['pool', 'Getting the card list', 8], ['art', 'Downloading card pictures', 17], ['detect', 'Finding cards in the video', 75]];
   const prog = makeProgress(stages);
-  job.status = 'scanning'; job.error = null; job.errorHTML = null;
+  job.status = 'scanning'; job.error = null; job.errorHTML = null; job.lastStep = null;
   await saveJob();
   let where = 'pool';
+  const crumb = setInterval(() => {          // if the browser kills the page, this says where it was
+    const step = `${$('pstage').textContent} ${$('ppct').textContent} ${$('pmsg').textContent}`.trim();
+    if (job && step && step !== job.lastStep) { job.lastStep = step; store.putJob(job).catch(() => {}); }
+  }, 2000);
   try {
     const data = need('data'), detect = need('detect');
     const voice = s.voice ? need('voice') : null, vmatch = s.voice ? need('vmatch') : null;
@@ -769,6 +781,17 @@ async function runScan() {
       }
     }
 
+    const nArt = artCount(artPool);
+    if (nArt > MAX_ART) {
+      const sets = [s.sets, s.drop].filter(Boolean).join(' + ');
+      const tip = s.voice
+        ? 'Voice didn’t catch enough card names to narrow it down.'
+        : 'Turn on “Listen for card names I say”. The app then only looks at the cards you name.';
+      if (!confirm(`That’s ${nArt.toLocaleString()} different card artworks to compare (${sets}). That’s more than most phones can hold in memory, and the browser may crash.\n\n${tip} Or remove a big set like plst (The List) and add the few cards it missed by hand afterwards.\n\nTap OK to try anyway, or Cancel to change the settings.`)) {
+        throw new Friendly(`Too many cards to compare on a phone (${nArt.toLocaleString()} artworks for ${sets}). ${tip} Or remove a big set like plst (The List) and add any cards it missed by hand. Change this under Overlay options → re-scan, or start the video again.`);
+      }
+    }
+
     if (typeof data.ensureArt === 'function') {
       where = 'art';
       prog.stage('art', `${artPool.length} card pictures`);
@@ -778,7 +801,10 @@ async function runScan() {
 
     where = 'detect';
     prog.stage('detect', '');
-    let events = await detect.detectCards(file, artPool, { skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal });
+    let events = await detect.detectCards(file, artPool, {
+      skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal,
+      ...(nArt > ONE_WORKER_ART ? { workers: 1 } : {}),     // don't hold a big index twice
+    });
     checkAbort(signal);
 
     if (s.voice) {
@@ -787,6 +813,8 @@ async function runScan() {
       events = vmatch.mergeVoice(events, hits, fullPool, { allowDupes: !!s.allowDupes });
     }
     prog.finish();
+    clearInterval(crumb);
+    job.lastStep = null;
     job.cards = normalizeEvents(events);
     job.status = 'review';
     job.output = null;
@@ -796,6 +824,7 @@ async function runScan() {
     toast(job.cards.length ? `Found ${job.cards.length} card${job.cards.length === 1 ? '' : 's'}` : 'No cards found');
   } catch (e) {
     console.error('scan failed', where, e);
+    clearInterval(crumb);
     if (e?.name === 'AbortError') {
       job.status = job.cards.length ? 'review' : 'new';
       job.error = null;
@@ -807,6 +836,7 @@ async function runScan() {
     }
     await saveJob();
   } finally {
+    clearInterval(crumb);
     endBusy();
     document.title = 'Pack Shorts';
     drawJob();
