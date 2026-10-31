@@ -219,6 +219,17 @@ let uidSeq = 0;
  * @param {{allowDupes?:boolean}} [opts]
  * @returns {object[]} CardEvent[]
  */
+// Everyday words that are also card names ("There", "Shock", "Opt", "Island" ...). Hearing one only counts
+// when the card is also seen by the camera; on its own it doesn't add a card.
+export const COMMON_WORDS = new Set(('a an and are as at be but by can do for from go got have he here how i if in is it '
+  + 'its just like look me my no not now of oh ok okay on one or our out so some that the then there these they this '
+  + 'to too up us was we well what when where which who why will with wow yeah yes you your again back down first '
+  + 'good great last let lets more much new next nice off only other over right see still take than them time two way '
+  + 'come day did done get give going hand into know make maybe need never pack card cards open really thing think '
+  + 'want watch who whoa wait shock opt island forest plains swamp mountain gift fling bolt duress').split(' '));
+
+const isCommonWord = (name) => { const n = normName(name); return !n.includes(' ') && COMMON_WORDS.has(n); };
+
 export function mergeVoice(events, hits, pool, { allowDupes = false } = {}) {
   hits = hits || [];
   const out = (events || []).map(e => {
@@ -251,11 +262,15 @@ export function mergeVoice(events, hits, pool, { allowDupes = false } = {}) {
   hits.forEach((h, k) => {
     if (used.has(k)) return;
     if (!allowDupes && out.some(e => e.name === h.name)) return;   // mentioned again later (e.g. recap)
+    // same name heard again within a few seconds (repeat, or overlapping speech windows) is one card
+    if (out.some(e => e.source === 'voice' && e.name === h.name && Math.abs(+e.time_s - h.t) < 8)) return;
+    if (isCommonWord(h.name)) return;                                 // e.g. "there" -> the card "There"
     const uniq = new Map();
     for (const r of byName.get(h.name) || []) uniq.set(r.id, r);   // keeps first position, last value (dict)
     const recs = [...uniq.values()].sort(collectorCompare);
     if (!recs.length) return;
-    const rep = recs[0];
+    // prefer the lowest-numbered printing that has a price (some printings, e.g. on The List, have none)
+    const rep = recs.find(r => num(r.usd) !== null || num(r.usd_foil) !== null) || recs[0];
     const usd = num(rep.usd), usdFoil = num(rep.usd_foil);
     const foil = !!(h.foil || (usd === null && usdFoil !== null));
     out.push({
@@ -264,7 +279,7 @@ export function mergeVoice(events, hits, pool, { allowDupes = false } = {}) {
       name: rep.name, set: rep.set, number: rep.number, rarity: rep.rarity,
       foil, usd, usd_foil: usdFoil, price: null, include: true, source: 'voice', heard: h.text,
       inliers: null,
-      alternates: recs.slice(1, 5).map(a => ({ id: a.id, set: a.set, number: a.number,
+      alternates: recs.filter(a => a !== rep).slice(0, 4).map(a => ({ id: a.id, set: a.set, number: a.number,
                                               usd: num(a.usd), usd_foil: num(a.usd_foil) })),
       scryfall_id: rep.id,
     });

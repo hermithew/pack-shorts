@@ -22,6 +22,9 @@ const BIG_POOL = 600;
 // plus the video decoder). Above MAX_ART we stop and suggest narrowing; above ONE_WORKER_ART we use one worker.
 const MAX_ART = 2000;
 const ONE_WORKER_ART = 800;
+// With voice on, only sets bigger than this (e.g. The List, ~5000 cards) are cut down to the names you said.
+// Normal-size sets stay whole, so a card you didn't name (or that was misheard) can still be found by its art.
+const BIG_SET = 1200;
 const artCount = (pool) => new Set(pool.map((r) => r.illustration_id || r.art_key || r.id)).size; // above this many card faces, voice also narrows the art search (same threshold as the original Python version)
 
 const DEFAULT_SETTINGS = {
@@ -469,7 +472,7 @@ function drawJob() {
   show('s-review', showReview);
   show('totalbar', showReview);
   show('s-done', done && !isBusy);
-  if (showReview) drawCards();
+  if (showReview) { drawCards(); drawHeard(); }
   $('render').disabled = !file || !!busy;
   $('render').textContent = file ? 'Make Short' : 'Make Short (pick video first)';
 }
@@ -523,6 +526,23 @@ function badge(c, anyVoice) {
   if (c.source === 'art' && anyVoice) return '<div class="badge">seen, not heard</div>';
   if (c.source === 'manual') return '<div class="badge">added by you</div>';
   return '';
+}
+
+/** "What it heard": the speech transcript in ~8-second lines, each with a time chip that jumps the video there. */
+function drawHeard() {
+  const box = $('heard');
+  const words = job?.transcript?.words || [];
+  show(box, words.length > 0);
+  if (!words.length) return;
+  const known = new Set((job.cards || []).filter((c) => c.heard).flatMap((c) => String(c.heard).toLowerCase().split(/\s+/)));
+  const lines = [];
+  for (const [t, w] of words) {
+    const last = lines[lines.length - 1];
+    if (!last || t - last.t >= 8) lines.push({ t, words: [w] }); else last.words.push(w);
+  }
+  $('heardtext').innerHTML = lines.map((l) => `<div class="hl"><button type="button" class="t" data-t="${l.t}">${l.t.toFixed(1)}s</button>
+    <span>${l.words.map((w) => known.has(String(w).toLowerCase()) ? `<mark>${esc(w)}</mark>` : esc(w)).join(' ')}</span></div>`).join('');
+  $('heardtext').querySelectorAll('[data-t]').forEach((b) => { b.onclick = () => seekTo(+b.dataset.t); });
 }
 
 function drawCards() {
@@ -776,10 +796,19 @@ async function runScan() {
       finally { try { voice.disposeVoice?.(); } catch (_) { /* ignore */ } }   // free the speech model before card finding
       checkAbort(signal);
       hits = heard?.hits || [];
+      job.transcript = heard?.words?.length
+        ? { mode: heard.mode || '', words: heard.words.slice(0, 4000).map((w) => [Math.round((+w.start || 0) * 10) / 10, String(w.text || '')]) }
+        : null;
       const names = new Set(hits.map((h) => h.name));
       if (hits.length && fullPool.length > BIG_POOL) {
-        artPool = fullPool.filter((r) => names.has(r.name));
-        prog.set(1, `searching art for just the ${names.size} card(s) you named (${artPool.length} printings instead of ${fullPool.length})`);
+        const perSet = new Map();
+        for (const r of fullPool) perSet.set(r.set, (perSet.get(r.set) || 0) + 1);
+        const big = new Set([...perSet].filter(([, n]) => n > BIG_SET).map(([k]) => k));
+        artPool = big.size ? fullPool.filter((r) => !big.has(r.set) || names.has(r.name)) : fullPool;
+        if (artCount(artPool) > MAX_ART) artPool = fullPool.filter((r) => names.has(r.name));   // still too many: heard names only
+        if (artPool.length < fullPool.length) {
+          prog.set(1, `${big.size ? [...big].join(', ') + ': only the cards you named · ' : ''}${artPool.length} printings to check instead of ${fullPool.length}`);
+        }
       }
     }
 
