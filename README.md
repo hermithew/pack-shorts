@@ -7,8 +7,9 @@ Pack Shorts is a phone web app (PWA). Install it from the browser and it works l
 **on your phone**:
 
 1. Pick a pack-opening video from your phone.
-2. Enter the set code(s) (`dsk`, `dsk,spg`, `sld:1650-1660`) or start typing a Secret Lair drop name. You can also add
-   the pack price.
+2. Pick the pack you're opening (e.g. "Murders at Karlov Manor Play Booster", "Zendikar Rising Draft Booster") so the
+   app uses exactly the cards that can be in it. Or enter set code(s) (`dsk`, `dsk,spg`, `sld:1650-1660`), or start
+   typing a Secret Lair drop name. You can also add the pack price.
 3. The app recognises each card by its artwork. You can also have it **listen for the card names you say**. Saying
    "foil" right before or after a name marks that card as foil.
 4. Check the list: tap a time to jump to that card, toggle ★ Foil, remove a card, type your own price, or add a card it
@@ -49,6 +50,7 @@ The app is small, but some things are downloaded the first time you need them an
 | Speech model for "Listen for card names I say" | ~80–150 MB | first time you use voice |
 | Card list and card pictures for a set | a few MB per set | first scan of that set (list refreshed daily, pictures kept) |
 | Secret Lair drop list | ~1 MB | first drop search (refreshed weekly) |
+| List of booster contents (~1,000 products) | ~10 MB | first pack search (refreshed weekly) |
 | Working copy of the video you're working on | same size as the video | while you work on it (only the latest one is kept) |
 
 After that, the app opens and works offline for sets you've already scanned. Prices refresh when you're online.
@@ -69,8 +71,8 @@ cache and reloads. Card-art and speech-model caches are kept.
 - When you pick a video, the app makes one private working copy of it inside its own storage on the phone. Android can
   otherwise take away access to a picked video partway through a long job. Only the latest video is kept, and you can
   delete it under **Storage on this phone**. For older jobs you'll be asked to pick the video again.
-- Network requests go only to Scryfall (card data and pictures), MTGJSON (Secret Lair drop names), and, if you use voice,
-  jsDelivr and Hugging Face (speech recogniser and model).
+- Network requests go only to Scryfall (card data and pictures), MTGJSON (Secret Lair drop names), GitHub
+  (raw.githubusercontent.com, booster contents), and, if you use voice, jsDelivr and Hugging Face (speech recogniser and model).
 
 ## Credits & licences
 
@@ -80,6 +82,8 @@ Made by hermithew — MIT licensed (see `LICENSE`).
 - **mp4-muxer** and **webm-muxer** by Vanilagy — MIT, see `lib/LICENSE-mp4-muxer.txt` and `lib/LICENSE-webm-muxer.txt`.
 - **Transformers.js** by Hugging Face — Apache License 2.0, loaded at runtime from cdn.jsdelivr.net. Whisper speech
   models from huggingface.co.
+- Booster contents (which cards can be in each product) from **[mtg.wtf](https://mtg.wtf)**'s open data,
+  [taw/magic-sealed-data](https://github.com/taw/magic-sealed-data). It's downloaded at runtime, not copied into this repository.
 - Card data and card images from **[Scryfall](https://scryfall.com)**. Please respect their
   [API guidelines](https://scryfall.com/docs/api). Secret Lair drop names from **[MTGJSON](https://mtgjson.com)**.
 - The platform look-alike overlays are generic drawings for positioning only. They're not the apps' real artwork.

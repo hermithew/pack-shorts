@@ -141,7 +141,7 @@ async function loadModules() {
     try { out[k] = await import(p); } catch (e) { out.errors[k] = e; console.error('module failed to load', p, e); }
   }));
   const api = params.get('api'); // test hook: point data.js at a mock Scryfall/MTGJSON, e.g. ?api=http://127.0.0.1:8841
-  if (api && out.data?.configure) out.data.configure({ scryfallBase: api + '/scryfall', mtgjsonBase: api + '/mtgjson' });
+  if (api && out.data?.configure) out.data.configure({ scryfallBase: api + '/scryfall', mtgjsonBase: api + '/mtgjson', packsUrl: api + '/packs/sealed.json' });
   return out;
 }
 
@@ -165,7 +165,11 @@ function showModuleErrors() {
 // ------------------------------------------------------------------ settings forms
 function scanFieldsHTML(p, { pack }) {
   return `
-  <label for="${p}-sets">Set code(s) in the pack</label>
+  <label for="${p}-booster">Pack you're opening</label>
+  <input id="${p}-booster" type="search" placeholder="e.g. Karlov Manor play, Zendikar Rising draft" autocomplete="off" spellcheck="false">
+  <div class="results" id="${p}-boosterlist"></div>
+  <div class="hint" id="${p}-boosterhint" hidden></div>
+  <label for="${p}-sets">…or set code(s)</label>
   <input id="${p}-sets" type="text" placeholder="e.g. dsk  or  dsk,spg  or  sld:1650-1660" autocapitalize="off" autocomplete="off" spellcheck="false">
   <label for="${p}-drop">…or a Secret Lair drop</label>
   <input id="${p}-drop" type="search" placeholder="start typing the drop name" autocomplete="off">
@@ -187,6 +191,10 @@ function readScanForm(p) {
     skipStart: Math.max(0, num($(`${p}-skip`).value) || 0), voice: $(`${p}-voice`).checked, allowDupes: $(`${p}-dupes`).checked,
   };
   if ($(`${p}-pack`)) out.packPrice = num($(`${p}-pack`).value);
+  const b = $(`${p}-booster`);
+  out.pack = b.value.trim() && b.value === b.dataset.name ? (b.dataset.code || '') : '';
+  out.packName = out.pack ? b.dataset.name : '';
+  out.packPer = out.pack ? +b.dataset.per || null : null;
   return out;
 }
 
@@ -197,6 +205,41 @@ function fillScanForm(p, s) {
   $(`${p}-voice`).checked = !!s.voice;
   $(`${p}-dupes`).checked = !!s.allowDupes;
   if ($(`${p}-pack`)) $(`${p}-pack`).value = s.packPrice ?? '';
+  setBooster(p, s.pack ? { code: s.pack, name: s.packName || s.pack, per: s.packPer } : null);
+}
+
+function setBooster(p, x) {
+  const b = $(`${p}-booster`);
+  b.value = x ? x.name : '';
+  b.dataset.code = x ? x.code : ''; b.dataset.name = x ? x.name : ''; b.dataset.per = x?.per || '';
+  const hint = $(`${p}-boosterhint`);
+  hint.textContent = x ? `Uses the exact cards that can be in this pack${x.per ? ` (${x.per} cards per pack)` : ''}. Set codes below are ignored.` : '';
+  show(hint, !!x);
+}
+
+function bindPackSearch(p, onPick) {
+  const input = $(`${p}-booster`), list = $(`${p}-boosterlist`);
+  const run = debounce(async () => {
+    const q = input.value.trim();
+    list.innerHTML = '';
+    if (q.length < 2 || q === input.dataset.name) return;
+    list.innerHTML = '<div><small>searching… (the first time downloads the list of packs, ~10 MB)</small></div>';
+    let r;
+    try { r = await need('data').searchPacks(q, 12); } catch (e) { list.innerHTML = `<div>${errorHTML(e, 'packs')}</div>`; return; }
+    if (input.value.trim() !== q) return;
+    list.innerHTML = r.length ? '' : '<div><small>no pack matches — try fewer words, or use set codes below</small></div>';
+    for (const x of r) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.innerHTML = `<b>${esc(x.name)}</b> <small>${x.per ? x.per + ' cards' : ''}</small>`;
+      b.onclick = () => { setBooster(p, x); list.innerHTML = ''; onPick?.(); };
+      list.appendChild(b);
+    }
+  }, 300);
+  input.addEventListener('input', () => {
+    if (input.value !== input.dataset.name) { input.dataset.code = ''; show(`${p}-boosterhint`, false); }
+    onPick?.(); run();
+  });
 }
 
 function bindDropSearch(p, onPick) {
@@ -345,17 +388,18 @@ async function setPicked(f) {
 
 function checkGo() {
   const s = readScanForm('n');
-  $('go').disabled = !(file && (s.sets || s.drop));
+  $('go').disabled = !(file && (s.sets || s.drop || s.pack));
   if (staging || !file) return;                  // keep copy progress / read errors visible
-  $('gostatus').textContent = !(s.sets || s.drop) ? 'Enter a set code or pick a Secret Lair drop.' : '';
+  $('gostatus').textContent = !(s.sets || s.drop || s.pack) ? 'Pick the pack you’re opening (or enter set codes).' : '';
 }
 
 async function startNewJob() {
   if (!file) return;
   const s = readScanForm('n');
-  if (!s.sets && !s.drop) return checkGo();
+  if (!s.sets && !s.drop && !s.pack) return checkGo();
   prefs.sets = s.sets; prefs.voice = s.voice;
-  store.setPref('sets', s.sets); store.setPref('voice', s.voice);
+  prefs.pack = s.pack ? { code: s.pack, name: s.packName, per: s.packPer } : null;
+  store.setPref('sets', s.sets); store.setPref('voice', s.voice); store.setPref('pack', prefs.pack);
   const settings = {
     ...DEFAULT_SETTINGS, ...s,
     tiers: prefs.tiers || DEFAULT_TIERS, outro: prefs.outro ?? 3, sfx: { ...DEFAULT_SETTINGS.sfx, ...(prefs.sfx || {}) },
@@ -390,7 +434,7 @@ async function showHome() {
   setPicked(null);
   $('file').value = '';
   show('v-home', true); show('v-job', false); show('totalbar', false);
-  fillScanForm('n', { sets: prefs.sets || '', voice: !!prefs.voice });
+  fillScanForm('n', { sets: prefs.sets || '', voice: !!prefs.voice, pack: prefs.pack?.code, packName: prefs.pack?.name, packPer: prefs.pack?.per });
   checkGo();
   await drawJobs();
 }
@@ -515,7 +559,9 @@ function updateTotal() {
     pr.className = 'l ' + (d >= 0 ? 'up' : 'down');
   } else { pr.textContent = ''; pr.className = 'l'; }
   const inc = cards.filter((c) => c.include !== false).length;
-  $('ccount').textContent = cards.length ? `${inc} of ${cards.length} · ${fmtMoney(total)}` : '';
+  const per = job.settings.pack ? +job.settings.packPer || 0 : 0;
+  const packs = job.settings.allowDupes ? '' : (per ? ` · a pack has ${per}` : '');
+  $('ccount').textContent = cards.length ? `${inc} of ${cards.length}${packs} · ${fmtMoney(total)}` : '';
 }
 
 const saveCards = debounce(() => saveJob(), 400);
@@ -668,7 +714,7 @@ $('rsfx').addEventListener('change', () => { $('rvol').disabled = !$('rsfx').che
 
 $('redetect').onclick = async () => {
   const s = readScanForm('r');
-  if (!s.sets && !s.drop) { toast('Enter a set code or a Secret Lair drop.'); $('r-sets').focus(); return; }
+  if (!s.sets && !s.drop && !s.pack) { toast('Pick the pack, or enter a set code or Secret Lair drop.'); $('r-booster').focus(); return; }
   if (job.cards.length && !confirm('Re-scan the video? Your edits to the card list will be replaced.')) return;
   job.settings = { ...job.settings, ...s };
   pool = null;
@@ -763,7 +809,7 @@ async function runScan() {
   if (busy || !job) return;
   if (!file) { drawJob(); return toast('Choose the video first.'); }
   const s = job.settings;
-  if (!s.sets && !s.drop) return toast('Enter a set code or a Secret Lair drop.');
+  if (!s.sets && !s.drop && !s.pack) return toast('Pick the pack, or enter a set code or Secret Lair drop.');
   const ctrl = startBusy('scan');
   const signal = ctrl.signal;
   const stages = s.voice
@@ -781,8 +827,8 @@ async function runScan() {
     const data = need('data'), detect = need('detect');
     const voice = s.voice ? need('voice') : null, vmatch = s.voice ? need('vmatch') : null;
 
-    prog.stage('pool', s.sets ? `set ${s.sets}${s.drop ? ' + ' + s.drop : ''}` : s.drop);
-    const fullPool = await data.buildPool({ sets: s.sets, drop: s.drop, onProgress: prog.cb, signal });
+    prog.stage('pool', s.pack ? (s.packName || s.pack) : s.sets ? `set ${s.sets}${s.drop ? ' + ' + s.drop : ''}` : s.drop);
+    const fullPool = await data.buildPool({ sets: s.sets, drop: s.drop, pack: s.pack || '', onProgress: prog.cb, signal });
     checkAbort(signal);
     if (!fullPool?.length) throw new Friendly(`Scryfall didn’t return any cards for “${[s.sets, s.drop].filter(Boolean).join(' / ')}”. Check the set code or drop name.`);
     pool = fullPool;
@@ -800,7 +846,10 @@ async function runScan() {
         ? { mode: heard.mode || '', words: heard.words.slice(0, 4000).map((w) => [Math.round((+w.start || 0) * 10) / 10, String(w.text || '')]) }
         : null;
       const names = new Set(hits.map((h) => h.name));
-      if (hits.length && fullPool.length > BIG_POOL) {
+      if (s.pack) {
+        // a pack's card list is already exact; only cut it down if it's too big for a phone
+        if (hits.length && artCount(fullPool) > MAX_ART) artPool = fullPool.filter((r) => names.has(r.name));
+      } else if (hits.length && fullPool.length > BIG_POOL) {
         const perSet = new Map();
         for (const r of fullPool) perSet.set(r.set, (perSet.get(r.set) || 0) + 1);
         const big = new Set([...perSet].filter(([, n]) => n > BIG_SET).map(([k]) => k));
@@ -845,6 +894,10 @@ async function runScan() {
       where = 'merge';
       prog.stage('merge', '');
       events = vmatch.mergeVoice(events, hits, fullPool, { allowDupes: !!s.allowDupes });
+    }
+    if (s.pack) {                                  // cards that only come on foil sheets in this pack are foil
+      const byId = new Map(fullPool.map((r) => [r.id, r]));
+      for (const e of events) if (byId.get(e.scryfall_id)?.foil_only) e.foil = true;
     }
     prog.finish();
     clearInterval(crumb);
@@ -1141,15 +1194,17 @@ async function main() {
   addEventListener('appinstalled', askPersist);
   bindStorage();
 
-  const [sets, voice, layout, plat, tiers, outro, sfx, persistAsked] = await Promise.all(
-    ['sets', 'voice', 'layout', 'platform', 'tiers', 'outro', 'sfx', 'persistAsked'].map((k) => store.getPref(k)));
-  prefs = { sets, voice, layout, platform: plat, tiers, outro, sfx, persistAsked };
+  const [sets, voice, layout, plat, tiers, outro, sfx, persistAsked, pack] = await Promise.all(
+    ['sets', 'voice', 'layout', 'platform', 'tiers', 'outro', 'sfx', 'persistAsked', 'pack'].map((k) => store.getPref(k)));
+  prefs = { sets, voice, layout, platform: plat, tiers, outro, sfx, persistAsked, pack };
   platform = plat || 'shorts';
 
   $('file').addEventListener('change', (e) => setPicked(e.target.files[0] || null));
   ['n-sets', 'n-skip', 'n-pack'].forEach((id) => $(id).addEventListener('input', checkGo));
   bindDropSearch('n', checkGo);
   bindDropSearch('r');
+  bindPackSearch('n', checkGo);
+  bindPackSearch('r');
   $('go').onclick = () => startNewJob();
 
   try { mods = await loadModules(); } catch (e) {

@@ -68,7 +68,16 @@ export async function searchDrops(query, limit = 10) {
   return DROPS.filter(([n]) => n.toLowerCase().includes(q)).slice(0, limit).map(([name, count]) => ({ name, count }));
 }
 
-export async function buildPool({ sets = '', drop = '', refresh = false, onProgress, signal } = {}) {
+const PACKS = [['tst-draft', 'Test Set Draft Booster', 15], ['tst-collector', 'Test Set Collector Booster', 15], ['mkm-play', 'Murders at Karlov Manor Play Booster', 14]];
+export async function searchPacks(query, limit = 12) {
+  await sleep(150);
+  const q = String(query || '').trim().toLowerCase();
+  if (q.length < 2) return [];
+  return PACKS.filter(([c, n]) => q.split(/\s+/).every((w) => (n + ' ' + c).toLowerCase().includes(w))).slice(0, limit)
+    .map(([code, name, per]) => ({ code, name, per, sets: [code.split('-')[0]] }));
+}
+export async function buildPool({ sets = '', drop = '', pack = '', refresh = false, onProgress, signal } = {}) {
+  if (pack) sets = pack.split('-')[0];
   const specs = parseSetSpecs(sets);
   if (specs.some((s) => s.code === 'offline')) { await sleep(400, signal); throw new TypeError('Failed to fetch'); }
   const bad = specs.find((s) => s.code === 'nope');

@@ -9,7 +9,12 @@
 //   Cache Storage 'pack-shorts-art-v1'  art crops keyed by art_key, kept forever (art never changes).
 //   NOTE for the service worker: do not delete caches named 'pack-shorts-art-*' on activate.
 
-const DEFAULTS = { scryfallBase: 'https://api.scryfall.com', mtgjsonBase: 'https://mtgjson.com/api/v5' };
+const DEFAULTS = {
+  scryfallBase: 'https://api.scryfall.com', mtgjsonBase: 'https://mtgjson.com/api/v5',
+  // Booster contents for ~1000 products (draft/set/play/collector...), from mtg.wtf's open data. Downloaded at
+  // runtime (not copied into this app) and cached for a week.
+  packsUrl: 'https://raw.githubusercontent.com/taw/magic-sealed-data/master/sealed_basic_data.json',
+};
 const CFG = { ...DEFAULTS };
 
 export const SET_MAX_AGE_MS = 24 * 3600 * 1000;      // PRICE_MAX_AGE_H
@@ -31,6 +36,7 @@ export function configure(opts = {}) {
     if (opts[k]) CFG[k] = String(opts[k]).replace(/\/+$/, '');
   }
   _dropsMem = null;
+  _packsMem = null;
   return { ...CFG };
 }
 
@@ -440,7 +446,115 @@ export async function findDrop(query, opts = {}) {
  * @param {{sets?: string, drop?: string, refresh?: boolean, onProgress?: Function, signal?: AbortSignal}} opts
  * @returns {Promise<object[]>} CardRecord[]
  */
-export async function buildPool({ sets = '', drop = '', refresh = false, onProgress, signal } = {}) {
+// ------------------------------------------------------------------------------------------
+// Packs (booster products): exact card lists per product
+// ------------------------------------------------------------------------------------------
+
+export const PACKS_MAX_AGE_MS = 7 * 86400 * 1000;
+let _packsMem = null;
+
+/** Compact product list: [{c: code, n: name, s: set name, src: [set codes], per: cards per pack, sh: {sheet: {f: foil, k: ['set:num', ...]}}}] */
+export async function loadPacks({ refresh = false, signal, onProgress } = {}) {
+  const key = `packs|${CFG.packsUrl}`;
+  if (!refresh && _packsMem?.key === key && Date.now() - _packsMem.fetched < PACKS_MAX_AGE_MS) return _packsMem.packs;
+  const cached = await idbGet('kv', key);
+  if (cached && !refresh && Date.now() - cached.fetched < PACKS_MAX_AGE_MS) { _packsMem = cached; return cached.packs; }
+  emit(onProgress, { stage: 'packs', fraction: null, message: 'Downloading the list of booster contents (weekly, ~10 MB)…' });
+  let raw;
+  try {
+    const r = await fetch(CFG.packsUrl, { signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    raw = await r.json();
+  } catch (e) {
+    if (isAbort(e)) throw e;
+    if (cached) { _packsMem = cached; return cached.packs; }
+    const err = new Error(`Couldn't download the list of booster contents (${e.message}). Check your connection, or enter set codes instead.`);
+    err.code = 'packs'; err.cause = e; throw err;
+  }
+  const packs = [];
+  for (const p of Array.isArray(raw) ? raw : []) {
+    if (!p?.code || !p.sheets || !p.boosters?.length) continue;
+    const top = [...p.boosters].sort((a, b) => (b.weight || 0) - (a.weight || 0))[0];
+    const per = Object.values(top.sheets || {}).reduce((a, b) => a + b, 0);
+    const sh = {};
+    for (const [name, sheet] of Object.entries(p.sheets)) {
+      const keys = Object.keys(sheet.cards || {});
+      sh[name] = { f: keys.length > 0 && keys.every(k => /:(foil|etched)$/.test(k)), k: keys.map(k => k.replace(/:(foil|etched)$/, '')) };
+    }
+    packs.push({ c: p.code, n: p.name, s: p.set_name || '', src: p.source_set_codes || [], per, sh });
+  }
+  if (!packs.length) { const err = new Error('The booster contents list was empty – its format may have changed.'); err.code = 'packs'; throw err; }
+  const entry = { key, fetched: Date.now(), packs };
+  await idbPut('kv', entry);
+  _packsMem = entry;
+  return packs;
+}
+
+/** Packs whose name/code match a query, best first (Arena-only and promo packs only when asked for). */
+export async function searchPacks(query, limit = 12) {
+  const packs = await loadPacks();
+  const q = normTitle(query);
+  if (!q) return [];
+  const words = q.split(' ');
+  const wantsOdd = /arena|promo|prerelease|sample/.test(q);
+  const scored = [];
+  for (const p of packs) {
+    const hay = normTitle(`${p.n} ${p.c} ${p.s}`);
+    if (!words.every(w => hay.includes(w))) continue;
+    if (!wantsOdd && /arena|promo|prerelease|sample/i.test(p.c)) continue;
+    const exact = normTitle(p.c) === q ? 0 : 1;
+    scored.push([exact, p.n.length, p]);
+  }
+  scored.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  return scored.slice(0, limit).map(([, , p]) => ({ code: p.c, name: p.n, per: p.per, sets: p.src }));
+}
+
+export async function packInfo(code) {
+  const p = (await loadPacks()).find(x => x.c === code);
+  if (!p) return null;
+  return { code: p.c, name: p.n, per: p.per, sets: p.src, sheets: Object.keys(p.sh) };
+}
+
+/**
+ * Card faces that can be in one product: its source sets' Scryfall lists filtered to the exact cards on its sheets.
+ * Adds `pack_sheets` (sheet names) and `foil_only` (only ever on foil sheets) to each record.
+ */
+export async function buildPackPool(code, { refresh = false, onProgress, signal } = {}) {
+  const p = (await loadPacks({ signal, onProgress })).find(x => x.c === code);
+  if (!p) throw new Error(`Unknown pack “${code}”.`);
+  const sheetsOf = new Map(), foilSeen = new Set(), plainSeen = new Set();
+  for (const [name, sh] of Object.entries(p.sh)) {
+    for (const k of sh.k) {
+      const key = k.toLowerCase();
+      if (!sheetsOf.has(key)) sheetsOf.set(key, []);
+      if (!sheetsOf.get(key).includes(name)) sheetsOf.get(key).push(name);
+      (sh.f ? foilSeen : plainSeen).add(key);
+    }
+  }
+  const sets = [...new Set([...p.src, ...[...sheetsOf.keys()].map(k => k.split(':')[0])])];
+  const pool = [], found = new Set(), seen = new Set();
+  for (let i = 0; i < sets.length; i++) {
+    emit(onProgress, { stage: 'cards', fraction: i / sets.length, message: `${p.n}: card list for ${sets[i].toUpperCase()}` });
+    const recs = await fetchSetList(sets[i], { refresh, onProgress, signal });
+    for (const r of recs) {
+      let key = `${String(r.set).toLowerCase()}:${String(r.number).toLowerCase()}`;
+      if (!sheetsOf.has(key) && sheetsOf.has(key + 'a')) key += 'a';          // split/DFC numbering differences
+      if (!sheetsOf.has(key)) continue;
+      const k2 = `${r.id}|${r.face || 0}`;
+      if (seen.has(k2)) continue;
+      seen.add(k2); found.add(key);
+      pool.push({ ...r, pack_sheets: sheetsOf.get(key), foil_only: foilSeen.has(key) && !plainSeen.has(key) });
+    }
+  }
+  const missing = sheetsOf.size - found.size;
+  emit(onProgress, { stage: 'cards', fraction: 1, warning: missing > 0,
+    message: `${p.n}: ${found.size} possible cards${missing > 0 ? ` (${missing} not found on Scryfall)` : ''}` });
+  if (!pool.length) throw new Error(`None of the cards for “${p.n}” were found on Scryfall.`);
+  return pool;
+}
+
+export async function buildPool({ sets = '', drop = '', pack = '', refresh = false, onProgress, signal } = {}) {
+  if (pack) return buildPackPool(pack, { refresh, onProgress, signal });
   const specs = parseSetSpecs(sets);
   drop = String(drop || '').trim();
   if (drop && !specs.some(s => s.code === 'sld')) specs.push({ code: 'sld', lo: null, hi: null });
