@@ -1,0 +1,1051 @@
+// Pack Shorts — the app shell: screens, card review, layout editor, scan/render orchestration, PWA plumbing.
+// Work is done by the other modules:
+//   data.js (buildPool, searchDrops, searchCards, ensureArt, configure)   detect.js (detectCards)
+//   voice.js (listen)   voice-match.js (mergeVoice)
+//   render/render.js (renderShort, canRender)   render/painter.js (totalSprite, cardSprite, defaultLayout)
+//   media/frames.js (grabFrame)
+// With ?mock=1 all of them come from js/mocks.js instead.
+
+import { makeTiers, tierFor, effectivePrice, fmtMoney, rgba, DEFAULT_TIERS, TIER_STYLES } from './tiers.js';
+import * as store from './store.js';
+import { LayoutEditor, PLATFORMS, platformOverlay } from './layout.js';
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const MOCK = params.get('mock') === '1';
+// Cache Storage names owned by other modules (cleared from the Storage section on the home screen)
+export const ART_CACHE_PREFIX = 'pack-shorts-art';      // data.js card-art cache (e.g. 'pack-shorts-art-v1')
+export const MODEL_CACHE_NAME = 'transformers-cache';   // Transformers.js speech model cache
+const BIG_POOL = 600; // above this many card faces, voice also narrows the art search (same threshold as the original Python version)
+
+const DEFAULT_SETTINGS = {
+  sets: '', drop: '', voice: false, allowDupes: false, skipStart: 0, packPrice: null,
+  tiers: DEFAULT_TIERS, outro: 3, popup: 2.5, sfx: { enabled: true, volume: 0.8, duck: 0.6 }, labels: false, layout: null,
+};
+
+// ------------------------------------------------------------------ state
+let mods = null;          // { data, detect, voice, vmatch, render, painter, frames, errors }
+let prefs = {};           // remembered: sets, voice, layout, platform, tiers, outro, sfxVolume, sfx
+let job = null;           // current job record (store.js shape)
+let file = null;          // the File for the current job (memory only)
+let srcURL = null, outURL = null;
+let result = null;        // { blob, mimeType, extension, codec } of the last render (memory only)
+let unsaved = false;      // a finished video exists that hasn't been downloaded or shared yet
+/** Ask before throwing away a finished video that was never saved. Returns true if it's OK to continue. */
+function okToDiscard() {
+  if (!result || !unsaved) return true;
+  if (!confirm('You haven’t saved the finished video yet. The app doesn’t keep it, so it will be gone (you can re-make it later from this job).\n\nLeave anyway?')) return false;
+  unsaved = false;
+  return true;
+}
+let pool = null;          // CardRecord[] for the current job (from buildPool; for "add a missed card")
+let busy = null;          // { kind: 'scan'|'render', ctrl: AbortController }
+let editing = false;      // showing the review list for a job that is 'done'
+let editor = null;        // LayoutEditor
+let platform = 'shorts';
+let wakeLock = null;
+
+// ------------------------------------------------------------------ helpers
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+const mb = (n) => (n / 1048576 >= 10 ? (n / 1048576).toFixed(0) : (n / 1048576).toFixed(1)) + ' MB';
+const stem = (name) => String(name || 'pack').replace(/\.[^.]+$/, '') || 'pack';
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+const uid = () => 'u' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+let toastT = null;
+function toast(msg, ms = 2600) {
+  const el = $('toast');
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+function show(el, on) { (typeof el === 'string' ? $(el) : el).hidden = !on; }
+
+class Friendly extends Error { constructor(msg, detail) { super(msg); this.friendly = true; this.detail = detail; } }
+
+/** Turn any thrown thing into a sentence a person can act on. `where` = stage key. */
+function friendlyError(e, where = '', ctx = {}) {
+  if (!e) return 'Something went wrong.';
+  if (e.friendly) return e.message;
+  if (e.name === 'AbortError') return 'Cancelled.';
+  const msg = String(e.message || e);
+  const net = e.name === 'TypeError' && /fetch|network|load failed/i.test(msg) || /Failed to fetch|NetworkError|network error|ERR_INTERNET|ERR_NAME|offline/i.test(msg);
+  if (net) {
+    if (where === 'pool') return 'Couldn’t reach Scryfall to get the card list. Check your internet connection and try again. (Sets you’ve scanned before also work offline.)';
+    if (where === 'art') return 'Couldn’t download the card pictures from Scryfall. Check your internet connection and try again.';
+    if (where === 'voice') return 'Couldn’t download the speech model. Check your internet connection, or turn off “Listen for card names I say” and scan again.';
+    if (where === 'drops') return 'Couldn’t reach MTGJSON for the Secret Lair list. Check your internet connection.';
+    if (where === 'detect') return 'Couldn’t download the card recogniser. Check your internet connection and try again.';
+    return 'A download failed. Check your internet connection and try again.';
+  }
+  if (/\b429\b|too many requests|rate.?limit/i.test(msg)) return 'Scryfall is busy right now. Wait a minute and try again.';
+  if (where === 'pool' && /not.?found|didn.t match|\b404\b|no cards|unknown set/i.test(msg)) {
+    const what = [ctx.sets, ctx.drop].filter(Boolean).join(' / ');
+    return `Scryfall didn’t find any cards for “${what}”. Check the set code (like dsk, or dsk,spg) or the drop name.`;
+  }
+  if (/quota|storage|disk/i.test(msg)) return 'Your phone is out of storage space for the app. Free some space (or delete old jobs) and try again.';
+  if (/out of memory|allocation|RangeError: Array buffer/i.test(msg)) return 'Your phone ran out of memory. Close other apps and try again, or try a shorter video.';
+  if (/codec|decod|demux|unsupported|not supported|moov|ftyp|mp4|container|EncodingError|NotSupportedError/i.test(msg) || e.name === 'NotSupportedError' || e.name === 'EncodingError') {
+    return where === 'render'
+      ? 'This phone can’t make the video in this format. Try updating Chrome, or try again after restarting the phone.'
+      : 'This phone can’t read this video’s format. Try a video recorded with the phone’s normal camera app (MP4).';
+  }
+  const doing = { pool: 'getting the card list', voice: 'listening for card names', art: 'downloading card pictures', detect: 'finding the cards',
+    merge: 'matching what you said', render: 'making the video', drops: 'searching drops' }[where] || 'working';
+  return `Something went wrong while ${doing}.`;
+}
+
+function errorHTML(e, where, ctx) {
+  const m = friendlyError(e, where, ctx);
+  const d = e && !e.friendly && e.name !== 'AbortError' ? String(e.stack || e.message || e).split('\n').slice(0, 4).join('\n') : (e?.detail || '');
+  return `<span class="err">${esc(m)}${d ? `<details><summary>Details</summary>${esc(d)}</details>` : ''}</span>`;
+}
+
+/** Normalise any onProgress argument shape into {fraction|null, message}. */
+function normProgress(p) {
+  if (p == null) return { fraction: null, message: '' };
+  if (typeof p === 'number') return { fraction: p > 1 ? p / 100 : p, message: '' };
+  if (typeof p === 'string') return { fraction: null, message: p };
+  let f = p.fraction ?? p.progress ?? null;
+  if (f == null && p.done != null && p.total) f = p.done / p.total;
+  if (f == null && p.loaded != null && p.total) f = p.loaded / p.total;
+  if (f == null && p.t != null && p.duration) f = p.t / p.duration;
+  if (f != null && f > 1.0001) f = f / 100;
+  return { fraction: f == null || !Number.isFinite(+f) ? null : Math.max(0, Math.min(1, +f)), message: p.message || p.status || p.text || '' };
+}
+
+// ------------------------------------------------------------------ modules
+const REAL = {
+  data: './data.js', detect: './detect.js', voice: './voice.js', vmatch: './voice-match.js',
+  render: './render/render.js', painter: './render/painter.js', frames: './media/frames.js',
+};
+const NICE = { data: 'card data', detect: 'card recogniser', voice: 'voice', vmatch: 'voice matching', render: 'video maker', painter: 'price boxes', frames: 'video frames' };
+
+async function loadModules() {
+  if (MOCK) {
+    const m = await import('./mocks.js');
+    return { data: m, detect: m, voice: m, vmatch: m, render: m, painter: m, frames: m, errors: {} };
+  }
+  const out = { errors: {} };
+  await Promise.all(Object.entries(REAL).map(async ([k, p]) => {
+    try { out[k] = await import(p); } catch (e) { out.errors[k] = e; console.error('module failed to load', p, e); }
+  }));
+  const api = params.get('api'); // test hook: point data.js at a mock Scryfall/MTGJSON, e.g. ?api=http://127.0.0.1:8841
+  if (api && out.data?.configure) out.data.configure({ scryfallBase: api + '/scryfall', mtgjsonBase: api + '/mtgjson' });
+  return out;
+}
+
+function need(k) {
+  if (mods?.[k]) return mods[k];
+  const e = mods?.errors?.[k];
+  throw new Friendly(`Part of the app (${NICE[k]}) didn’t load, so this can’t run. Reload the page; if it keeps happening, the app may be mid-update.`,
+    e ? `${REAL[k]}: ${e.message || e}` : REAL[k]);
+}
+
+function showModuleErrors() {
+  const bad = Object.keys(mods.errors);
+  if (!bad.length) return;
+  const box = $('modwarn');
+  box.innerHTML = `<b>Some parts of the app didn’t load:</b> ${bad.map((k) => esc(NICE[k])).join(', ')}.
+    <div class="hint">${bad.map((k) => `${esc(REAL[k])}: ${esc(mods.errors[k]?.message || mods.errors[k])}`).join('<br>')}</div>
+    <div class="hint">Reload the page. If you're offline, connect once so the app can finish installing.</div>`;
+  box.hidden = false;
+}
+
+// ------------------------------------------------------------------ settings forms
+function scanFieldsHTML(p, { pack }) {
+  return `
+  <label for="${p}-sets">Set code(s) in the pack</label>
+  <input id="${p}-sets" type="text" placeholder="e.g. dsk  or  dsk,spg  or  sld:1650-1660" autocapitalize="off" autocomplete="off" spellcheck="false">
+  <label for="${p}-drop">…or a Secret Lair drop</label>
+  <input id="${p}-drop" type="search" placeholder="start typing the drop name" autocomplete="off">
+  <div class="results" id="${p}-droplist"></div>
+  <div class="row2">
+    ${pack ? `<div><label for="${p}-pack">Pack cost ($)</label><input id="${p}-pack" type="number" inputmode="decimal" step="0.01" min="0" placeholder="optional"></div>` : ''}
+    <div><label for="${p}-skip">Ignore first (sec)</label><input id="${p}-skip" type="number" inputmode="decimal" step="0.5" min="0" placeholder="0"></div>
+  </div>
+  <label class="check"><input id="${p}-voice" type="checkbox"> Listen for card names I say</label>
+  <label class="check"><input id="${p}-dupes" type="checkbox"> More than one pack in this video</label>`;
+}
+
+const cleanSets = (s) => String(s || '').toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9,:\-]/g, '');
+const cleanDrop = (s) => String(s || '').replace(/[\x00-\x1f"]/g, '').trim().slice(0, 120);
+
+function readScanForm(p) {
+  const out = {
+    sets: cleanSets($(`${p}-sets`).value), drop: cleanDrop($(`${p}-drop`).value),
+    skipStart: Math.max(0, num($(`${p}-skip`).value) || 0), voice: $(`${p}-voice`).checked, allowDupes: $(`${p}-dupes`).checked,
+  };
+  if ($(`${p}-pack`)) out.packPrice = num($(`${p}-pack`).value);
+  return out;
+}
+
+function fillScanForm(p, s) {
+  $(`${p}-sets`).value = s.sets || '';
+  $(`${p}-drop`).value = s.drop || '';
+  $(`${p}-skip`).value = s.skipStart ? s.skipStart : '';
+  $(`${p}-voice`).checked = !!s.voice;
+  $(`${p}-dupes`).checked = !!s.allowDupes;
+  if ($(`${p}-pack`)) $(`${p}-pack`).value = s.packPrice ?? '';
+}
+
+function bindDropSearch(p, onPick) {
+  const input = $(`${p}-drop`), list = $(`${p}-droplist`);
+  const run = debounce(async () => {
+    const q = input.value.trim();
+    list.innerHTML = '';
+    if (q.length < 2) return;
+    list.innerHTML = '<div><small>searching…</small></div>';
+    let r;
+    try { r = await need('data').searchDrops(q, 12); } catch (e) { list.innerHTML = `<div>${errorHTML(e, 'drops')}</div>`; return; }
+    if (input.value.trim() !== q) return;
+    list.innerHTML = r.length ? '' : '<div><small>no drop matches</small></div>';
+    for (const x of r) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.innerHTML = `<b>${esc(x.name)}</b> <small>${x.count ?? x.cards ?? '?'} card${(x.count ?? x.cards) === 1 ? '' : 's'}</small>`;
+      b.onclick = () => { input.value = x.name; list.innerHTML = ''; onPick?.(); };
+      list.appendChild(b);
+    }
+  }, 300);
+  input.addEventListener('input', () => { onPick?.(); run(); });
+}
+
+/** Overlay-options form -> settings fields. Returns null (and marks the field) if tiers are invalid. */
+function readOptions() {
+  const tiersRaw = $('rtiers').value.replace(/[^0-9.,]/g, '');
+  const ok = !tiersRaw || /^\d+(\.\d+)?(,\d+(\.\d+)?){0,3}$/.test(tiersRaw);
+  $('rtiers').classList.toggle('bad', !ok);
+  if (!ok) return null;
+  const outro = num($('routro').value);
+  return {
+    tiers: tiersRaw || DEFAULT_TIERS,
+    packPrice: num($('rpack').value),
+    outro: outro == null ? 3 : Math.max(0, Math.min(15, outro)),
+    sfx: { ...(job?.settings?.sfx || DEFAULT_SETTINGS.sfx), enabled: $('rsfx').checked, volume: num($('rvol').value) ?? 0.8 },
+  };
+}
+
+function fillOptions(s) {
+  $('rtiers').value = s.tiers && s.tiers !== DEFAULT_TIERS ? s.tiers : '';
+  $('rpack').value = s.packPrice ?? '';
+  $('routro').value = s.outro ?? '';
+  $('rsfx').checked = s.sfx?.enabled !== false;
+  const v = String(s.sfx?.volume ?? 0.8);
+  $('rvol').value = ['0.5', '0.8', '1.2'].includes(v) ? v : '0.8';
+  fillScanForm('r', s);
+  drawTierDemo();
+}
+
+function drawTierDemo() {
+  const spec = $('rtiers').value.replace(/[^0-9.,]/g, '') || DEFAULT_TIERS;
+  const tiers = makeTiers(spec);
+  $('tierdemo').innerHTML = tiers.map((t, i) => {
+    const hi = tiers[i + 1] ? `–${fmtMoney(tiers[i + 1].min - 0.01)}` : '+';
+    const label = t.top ? t.top : t.key === 'bulk' ? 'bulk' : 'nice';
+    return `<span style="background:${rgba(t.fill)};border-color:${rgba(t.outline)};color:${rgba(t.price)}">${esc(label)} ${fmtMoney(t.min)}${hi}</span>`;
+  }).join('');
+}
+
+const saveOptions = debounce(async () => {
+  if (!job) return;
+  const o = readOptions();
+  if (!o) return;
+  job.settings = { ...job.settings, ...o };
+  prefs.tiers = o.tiers; prefs.outro = o.outro; prefs.sfx = o.sfx;
+  store.setPref('tiers', o.tiers); store.setPref('outro', o.outro); store.setPref('sfx', o.sfx);
+  await saveJob();
+  updateTotal();
+  if (editor && !$('laybox').hidden) refreshSprites();
+}, 300);
+
+// ------------------------------------------------------------------ jobs list (home)
+const STATUS_LABEL = { new: 'new', scanning: 'interrupted', rendering: 'interrupted', review: 'review', done: 'done', error: 'error' };
+
+async function drawJobs() {
+  const jobs = await store.listJobs();
+  show('s-jobs', jobs.length > 0);
+  const box = $('jobs');
+  box.innerHTML = '';
+  for (const j of jobs.slice(0, 15)) {
+    const inc = (j.cards || []).filter((c) => c.include !== false);
+    const total = inc.reduce((a, c) => a + effectivePrice(c), 0);
+    const row = document.createElement('div');
+    row.className = 'job';
+    row.dataset.id = j.id;
+    const st = STATUS_LABEL[j.status] || j.status;
+    row.innerHTML = `<button type="button"><span class="jn">${esc(j.name)}</span>
+      <small><span class="st st-${esc(j.status)}">${esc(st)}</span>${new Date(j.created).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+      ${inc.length ? ` · ${inc.length} card${inc.length === 1 ? '' : 's'} · ${fmtMoney(total)}` : ''}</small></button>
+      <button type="button" class="del" aria-label="Delete ${esc(j.name)}" title="Delete">×</button>`;
+    row.querySelector('button').onclick = () => { location.hash = 'job=' + j.id; };
+    row.querySelector('.del').onclick = async () => {
+      if (!confirm(`Delete “${j.name}”? Its card list and settings will be removed (your video isn’t touched).`)) return;
+      await store.deleteJob(j.id);
+      drawJobs();
+    };
+    box.appendChild(row);
+  }
+}
+
+// ------------------------------------------------------------------ home: new job
+function setPicked(f) {
+  file = f;
+  const pick = $('pick');
+  pick.classList.toggle('has', !!f);
+  $('fname').textContent = f ? f.name : 'Choose your pack-opening video';
+  $('fmeta').textContent = f ? `${mb(f.size)} · tap to choose a different one` : 'Vertical works best. It stays on your phone.';
+  checkGo();
+}
+
+function checkGo() {
+  const s = readScanForm('n');
+  $('go').disabled = !(file && (s.sets || s.drop));
+  $('gostatus').textContent = file && !(s.sets || s.drop) ? 'Enter a set code or pick a Secret Lair drop.' : '';
+}
+
+async function startNewJob() {
+  if (!file) return;
+  const s = readScanForm('n');
+  if (!s.sets && !s.drop) return checkGo();
+  prefs.sets = s.sets; prefs.voice = s.voice;
+  store.setPref('sets', s.sets); store.setPref('voice', s.voice);
+  const settings = {
+    ...DEFAULT_SETTINGS, ...s,
+    tiers: prefs.tiers || DEFAULT_TIERS, outro: prefs.outro ?? 3, sfx: { ...DEFAULT_SETTINGS.sfx, ...(prefs.sfx || {}) },
+    layout: prefs.layout || null,
+  };
+  job = await store.putJob({
+    id: store.newId(), name: file.name, size: file.size, lastModified: file.lastModified, type: file.type,
+    settings, cards: [], status: 'new', error: null, created: Date.now(), output: null,
+  });
+  const id = job.id;
+  job = null;                                  // openJob() loads it and keeps `file` (same name + size)
+  history.pushState(null, '', '#job=' + id);
+  await openJob(id);
+  runScan();
+}
+
+// ------------------------------------------------------------------ routing
+let routeDone = Promise.resolve();
+function route() {
+  routeDone = (async () => {
+    const m = location.hash.match(/job=([\w-]+)/);
+    if (m) return openJob(m[1]);
+    return showHome();
+  })();
+  return routeDone;
+}
+
+async function showHome() {
+  if (busy) { location.hash = 'job=' + job.id; return; }
+  job = null; pool = null; result = null; editing = false;
+  setVideo(null);
+  setPicked(null);
+  $('file').value = '';
+  show('v-home', true); show('v-job', false); show('totalbar', false);
+  fillScanForm('n', { sets: prefs.sets || '', voice: !!prefs.voice });
+  checkGo();
+  await drawJobs();
+}
+
+async function openJob(id) {
+  if (busy && job?.id !== id) { toast('Finish or cancel the current job first.'); location.hash = 'job=' + job.id; return; }
+  if (job?.id !== id) {
+    const j = await store.getJob(id);
+    if (!j) { toast('That job no longer exists.'); location.hash = ''; return; }
+    const keepFile = file && file.name === j.name && file.size === j.size ? file : null;
+    if (!okToDiscard()) { location.hash = 'job=' + job.id; return; }
+    job = j; pool = null; result = null; editing = false;
+    if (outURL) { URL.revokeObjectURL(outURL); outURL = null; }
+    setVideo(keepFile);
+    // a scan/render that was running when the page closed can't be resumed
+    if (!busy && (job.status === 'scanning' || job.status === 'rendering')) {
+      job.status = job.cards?.length ? 'review' : 'new';
+      job.error = 'The last run was interrupted (the page was closed or reloaded). Run it again when you’re ready.';
+      await saveJob();
+    }
+  }
+  show('v-home', false); show('v-job', true);
+  window.scrollTo(0, 0);
+  fillOptions(job.settings);
+  closeLayout();
+  drawJob();
+}
+
+window.addEventListener('hashchange', route);
+$('home').addEventListener('click', (e) => { e.preventDefault(); if (busy) return toast('Finish or cancel the current job first.'); if (!okToDiscard()) return; location.hash = ''; });
+$('new').onclick = () => { if (busy) return toast('Finish or cancel the current job first.'); if (!okToDiscard()) return; location.hash = ''; };
+
+// ------------------------------------------------------------------ job view
+function setVideo(f) {
+  file = f;
+  if (srcURL) { URL.revokeObjectURL(srcURL); srcURL = null; }
+  const v = $('src');
+  if (f) { srcURL = URL.createObjectURL(f); v.src = srcURL; } else { v.removeAttribute('src'); v.load(); }
+  show(v, !!f); show('novideo', !f);
+}
+
+async function saveJob() {
+  if (!job) return;
+  job = await store.putJob(job);
+}
+
+function drawJob() {
+  if (!job) return;
+  $('jobname').textContent = job.name;
+  $('jobmeta').textContent = `${mb(job.size)} · ${new Date(job.created).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+  const isBusy = !!busy;
+  const done = job.status === 'done' && result && !editing;
+  const hasCards = (job.cards || []).length > 0;
+  const showReview = !isBusy && !done && (hasCards || job.status === 'review' || job.status === 'done');
+
+  // status line
+  let st = '';
+  if (isBusy) st = '';
+  else if (job.error) st = job.errorHTML || `<span class="err">${esc(job.error)}</span>`;
+  else if (done) st = 'Done! Watch it, then download or share.';
+  else if (showReview) st = hasCards ? 'Check the cards below.' : 'No cards yet.';
+  else st = file ? 'Ready to find the cards.' : '';
+  $('jstatus').innerHTML = st;
+  show('jprog', isBusy);
+  show('new', !isBusy);
+  show('scanagain', !isBusy && !showReview && !done && !!file);
+
+  // re-pick prompt when the video isn't in memory
+  show('repick', !file && !isBusy);
+  $('repickmsg').innerHTML = `Videos aren’t stored by the app. To ${hasCards ? 'make the Short' : 'find the cards'}, choose the same video again: <b>${esc(job.name)}</b> (${mb(job.size)}).`;
+
+  show('s-review', showReview);
+  show('totalbar', showReview);
+  show('s-done', done && !isBusy);
+  if (showReview) drawCards();
+  $('render').disabled = !file || !!busy;
+  $('render').textContent = file ? 'Make Short' : 'Make Short (pick video first)';
+}
+
+$('refile').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f || !job) return;
+  if (f.name !== job.name || f.size !== job.size) {
+    const ok = confirm(`This doesn’t look like the same video.\n\nExpected: ${job.name} (${mb(job.size)})\nChosen: ${f.name} (${mb(f.size)})\n\nUse it anyway? Card times may not line up.`);
+    if (!ok) return;
+    job.name = f.name; job.size = f.size; job.lastModified = f.lastModified; job.type = f.type;
+    await saveJob();
+  }
+  setVideo(f);
+  drawJob();
+  if (editor && !$('laybox').hidden) setFrame();
+});
+
+$('scanagain').onclick = () => runScan();
+
+// ------------------------------------------------------------------ card list
+function totalOf(cards) {
+  return cards.filter((c) => c.include !== false).reduce((a, c) => a + effectivePrice(c), 0);
+}
+
+function updateTotal() {
+  if (!job) return;
+  const cards = job.cards || [];
+  const total = totalOf(cards);
+  $('tval').textContent = fmtMoney(total);
+  const paid = num(job.settings.packPrice);
+  const pr = $('tprofit');
+  if (paid) {
+    const d = total - paid;
+    pr.textContent = `paid ${fmtMoney(paid)} → ${d >= 0 ? '+' : '−'}${fmtMoney(Math.abs(d))}`;
+    pr.className = 'l ' + (d >= 0 ? 'up' : 'down');
+  } else { pr.textContent = ''; pr.className = 'l'; }
+  const inc = cards.filter((c) => c.include !== false).length;
+  $('ccount').textContent = cards.length ? `${inc} of ${cards.length} · ${fmtMoney(total)}` : '';
+}
+
+const saveCards = debounce(() => saveJob(), 400);
+
+function badge(c, anyVoice) {
+  if (c.source === 'voice') return `<div class="badge warn">🎤 heard “${esc(c.heard)}” but not seen — check it</div>`;
+  if (c.source === 'art+voice') return `<div class="badge good">🎤 heard “${esc(c.heard)}”</div>`;
+  if (c.source === 'art' && anyVoice) return '<div class="badge">seen, not heard</div>';
+  if (c.source === 'manual') return '<div class="badge">added by you</div>';
+  return '';
+}
+
+function drawCards() {
+  const cards = job.cards || (job.cards = []);
+  cards.forEach((c) => { if (!c.uid) c.uid = uid(); });
+  cards.sort((a, b) => (+a.time_s || 0) - (+b.time_s || 0));
+  const tiers = makeTiers(job.settings.tiers);
+  const anyVoice = cards.some((c) => c.source === 'voice' || c.source === 'art+voice');
+  const box = $('cards');
+  box.innerHTML = cards.length ? '' : '<div class="empty">No cards found. Add them below, or check the set code and re-scan (Overlay options).</div>';
+  for (const c of cards) {
+    const el = document.createElement('div');
+    const off = c.include === false;
+    el.className = 'c' + (off ? ' off' : '');
+    el.dataset.uid = c.uid;
+    const base = c.foil ? (c.usd_foil ?? c.usd) : (c.usd ?? c.usd_foil);
+    const tier = tierFor(effectivePrice(c), tiers);
+    const alts = (c.alternates || []).filter(Boolean);
+    el.innerHTML = `<button type="button" class="t" title="Jump to this moment">${(+c.time_s || 0).toFixed(1)}s</button>
+      <div class="info"><div class="n"><span class="tierdot" style="background:${rgba(tier.outline)}" title="${esc(tier.top || tier.key)}"></span>${esc(c.name)}</div>
+        <div class="sub">${esc(c.set || '')} ${c.number ? '#' + esc(c.number) : ''} ${esc(c.rarity || '')}</div>
+        ${badge(c, anyVoice)}
+        ${alts.length ? `<div class="alts">same art: ${alts.map((a, i) => `<span>${esc(a.set)} #${esc(a.number)} ${a.usd != null ? fmtMoney(a.usd) : ''}</span><button type="button" data-alt="${i}">use this</button>`).join('')}</div>` : ''}
+      </div>
+      <input class="p${c.price != null && c.price !== '' ? ' set' : ''}" type="number" inputmode="decimal" step="0.01" min="0" aria-label="Price for ${esc(c.name)}"
+        value="${c.price != null && c.price !== '' ? esc(c.price) : ''}" placeholder="${base != null ? Number(base).toFixed(2) : '0.00'}">
+      <div class="tools">
+        <button type="button" class="chip ${c.foil ? 'on' : ''}" data-a="foil" aria-pressed="${!!c.foil}">★ Foil${c.usd_foil != null ? ' ' + fmtMoney(c.usd_foil) : ''}</button>
+        <button type="button" class="chip x ${off ? 'on' : ''}" data-a="drop" aria-pressed="${off}">${off ? 'Removed — undo' : 'Remove'}</button>
+      </div>`;
+    el.querySelector('.t').onclick = () => seekTo(+c.time_s || 0);
+    const pin = el.querySelector('.p');
+    pin.addEventListener('input', () => {
+      const v = pin.value.trim();
+      c.price = v === '' ? null : num(v);
+      pin.classList.toggle('set', c.price != null);
+      updateTotal(); saveCards();
+    });
+    pin.addEventListener('change', () => drawCards());
+    el.querySelector('[data-a=foil]').onclick = () => { c.foil = !c.foil; drawCards(); saveCards(); };
+    el.querySelector('[data-a=drop]').onclick = () => { c.include = c.include === false; drawCards(); saveCards(); };
+    el.querySelectorAll('[data-alt]').forEach((b) => {
+      b.onclick = () => {
+        const a = c.alternates[+b.dataset.alt];
+        const cur = { id: c.scryfall_id, set: c.set, number: c.number, usd: c.usd, usd_foil: c.usd_foil };
+        Object.assign(c, { scryfall_id: a.id, set: a.set, number: a.number, usd: a.usd ?? null, usd_foil: a.usd_foil ?? null });
+        c.alternates = c.alternates.map((x, i) => (i === +b.dataset.alt ? cur : x));
+        drawCards(); saveCards();
+      };
+    });
+    box.appendChild(el);
+  }
+  updateTotal();
+}
+
+function seekTo(t) {
+  const v = $('src');
+  if (!file) return toast('Choose the video again to jump to it.');
+  v.currentTime = Math.max(0, t - 0.2);
+  v.pause();
+  const r = v.getBoundingClientRect();
+  if (r.top < 0 || r.bottom > innerHeight) v.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// add a missed card
+$('addbtn').onclick = () => {
+  const open = $('addbox').hidden;
+  show('addbox', open);
+  $('addat').textContent = ($('src').currentTime || 0).toFixed(1) + 's';
+  if (open) { $('q').focus(); ensurePool().catch(() => {}); }
+};
+$('src').addEventListener('timeupdate', () => { $('addat').textContent = ($('src').currentTime || 0).toFixed(1) + 's'; });
+
+async function ensurePool() {
+  if (pool) return pool;
+  const s = job.settings;
+  pool = await need('data').buildPool({ sets: s.sets, drop: s.drop });
+  return pool;
+}
+
+$('q').addEventListener('input', debounce(async () => {
+  const q = $('q').value.trim(), res = $('results');
+  if (q.length < 2) { res.innerHTML = ''; return; }
+  res.innerHTML = '<div><small>searching…</small></div>';
+  let list;
+  try { list = need('data').searchCards(await ensurePool(), q, 15); } catch (e) { res.innerHTML = `<div>${errorHTML(e, 'pool', job.settings)}</div>`; return; }
+  if ($('q').value.trim() !== q) return;
+  res.innerHTML = list.length ? '' : '<div><small>no cards match — type it in below</small></div>';
+  const seen = new Set();
+  for (const x of list) {
+    if (seen.has(x.id)) continue;
+    seen.add(x.id);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.innerHTML = `<b>${esc(x.name)}</b> <small>${esc(x.set)} #${esc(x.number)} · ${x.usd != null ? fmtMoney(x.usd) : '—'}${x.usd_foil != null ? ' · foil ' + fmtMoney(x.usd_foil) : ''}</small>`;
+    b.onclick = () => addCard({ name: x.name, set: x.set, number: x.number, rarity: x.rarity, usd: x.usd ?? null, usd_foil: x.usd_foil ?? null,
+      scryfall_id: x.id, foil: x.usd == null && x.usd_foil != null });
+    res.appendChild(b);
+  }
+}, 250));
+
+$('madd').onclick = () => {
+  const name = $('mname').value.trim();
+  if (!name) { $('mname').focus(); return; }
+  addCard({ name, price: num($('mprice').value) });
+  $('mname').value = ''; $('mprice').value = '';
+};
+
+function addCard(x) {
+  const t = +(($('src').currentTime || 0).toFixed(2));
+  job.cards.push({
+    uid: uid(), time_s: t, name: '', set: '', number: '', rarity: '', foil: false, usd: null, usd_foil: null, price: null,
+    include: true, source: 'manual', heard: '', inliers: null, alternates: [], scryfall_id: '', ...x,
+  });
+  $('q').value = ''; $('results').innerHTML = ''; show('addbox', false);
+  drawCards(); saveJob();
+  toast(`Added ${x.name} at ${t.toFixed(1)}s`);
+}
+
+// options
+['rtiers', 'rpack', 'routro', 'rsfx', 'rvol'].forEach((id) => $(id).addEventListener('input', () => { if (id === 'rtiers') drawTierDemo(); saveOptions(); }));
+$('rsfx').addEventListener('change', () => { $('rvol').disabled = !$('rsfx').checked; saveOptions(); });
+
+$('redetect').onclick = async () => {
+  const s = readScanForm('r');
+  if (!s.sets && !s.drop) { toast('Enter a set code or a Secret Lair drop.'); $('r-sets').focus(); return; }
+  if (job.cards.length && !confirm('Re-scan the video? Your edits to the card list will be replaced.')) return;
+  job.settings = { ...job.settings, ...s };
+  pool = null;
+  await saveJob();
+  if (!file) { drawJob(); $('repick').scrollIntoView({ behavior: 'smooth', block: 'center' }); return toast('Choose the video again first.'); }
+  runScan();
+};
+
+// ------------------------------------------------------------------ busy / progress
+async function lockScreen() {
+  try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* not allowed */ }
+}
+document.addEventListener('visibilitychange', () => { if (busy && document.visibilityState === 'visible') lockScreen(); });
+window.addEventListener('beforeunload', (e) => { if (busy || (result && unsaved)) { e.preventDefault(); e.returnValue = ''; } });
+
+function startBusy(kind) {
+  const ctrl = new AbortController();
+  busy = { kind, ctrl };
+  lockScreen();
+  $('cancel').disabled = false;
+  closeLayout();
+  drawJob();
+  return ctrl;
+}
+function endBusy() {
+  busy = null;
+  try { wakeLock?.release(); } catch (e) { /* ignore */ }
+  wakeLock = null;
+}
+
+$('cancel').onclick = () => {
+  if (!busy) return;
+  $('cancel').disabled = true;
+  $('pmsg').textContent = 'Stopping…';
+  busy.ctrl.abort();
+};
+
+// Modules report their own sub-stages, each going 0 -> 1. Map them onto parts of our stage so the bar keeps moving.
+const SUBSTAGES = {
+  voice: { audio: [0, 0.08], download: [0.08, 0.4], load: [0.4, 0.45], transcribe: [0.45, 1] },
+  detect: { art: [0, 0.05], index: [0.05, 0.25], detect: [0.25, 1] },
+};
+
+/** Weighted multi-stage progress display. stages = [[key, label, weight], ...] */
+function makeProgress(stages) {
+  const total = stages.reduce((a, s) => a + s[2], 0);
+  let idx = -1, frac = 0;
+  $('psteps').innerHTML = stages.map(([k, l]) => `<span data-k="${k}">${esc(l)}</span>`).join('');
+  const paint = (msg) => {
+    const before = stages.slice(0, Math.max(0, idx)).reduce((a, s) => a + s[2], 0);
+    const cur = idx >= 0 ? stages[idx] : null;
+    const overall = cur ? (before + cur[2] * frac) / total : 0;
+    const pct = Math.floor(overall * 100);
+    $('pbar').style.width = (overall * 100).toFixed(1) + '%';
+    $('ppct').textContent = pct + '%';
+    if (cur) $('pstage').textContent = `Step ${idx + 1} of ${stages.length} · ${cur[1]}…`;
+    if (msg != null) $('pmsg').textContent = msg;
+    document.querySelectorAll('#psteps span').forEach((s, i) => { s.className = i < idx ? 'ok' : i === idx ? 'now' : ''; });
+    document.title = `${pct}% · Pack Shorts`;
+  };
+  return {
+    stage(key, msg = '') { idx = stages.findIndex((s) => s[0] === key); frac = 0; paint(msg); },
+    cb: (p) => {
+      const n = normProgress(p);
+      let f = n.fraction;
+      const span = idx >= 0 && SUBSTAGES[stages[idx][0]]?.[p?.stage];
+      if (f != null && span) f = span[0] + (span[1] - span[0]) * f;
+      if (f != null) frac = Math.max(frac, f);
+      paint(n.message || null);
+    },
+    set(f, msg) { frac = f; paint(msg); },
+    finish() { idx = stages.length - 1; frac = 1; paint(''); document.title = 'Pack Shorts'; },
+  };
+}
+
+function checkAbort(signal) { if (signal.aborted) throw new DOMException('Cancelled', 'AbortError'); }
+
+/** Ensure every row is a well-formed CardEvent. */
+function normalizeEvents(events) {
+  return (events || []).map((e) => ({
+    uid: e.uid || uid(), time_s: +e.time_s || 0, name: e.name || '', set: e.set || '', number: e.number != null ? String(e.number) : '',
+    rarity: e.rarity || '', foil: !!e.foil && e.foil !== '0', usd: e.usd == null || e.usd === '' ? null : +e.usd,
+    usd_foil: e.usd_foil == null || e.usd_foil === '' ? null : +e.usd_foil, price: e.price == null || e.price === '' ? null : +e.price,
+    include: e.include !== false && e.include !== '0', source: e.source || 'art', heard: e.heard || '',
+    inliers: e.inliers == null || e.inliers === '' ? null : +e.inliers, alternates: Array.isArray(e.alternates) ? e.alternates : [],
+    scryfall_id: e.scryfall_id || '',
+  }));
+}
+
+// ------------------------------------------------------------------ scan (ported from the original Python version detect())
+async function runScan() {
+  if (busy || !job) return;
+  if (!file) { drawJob(); return toast('Choose the video first.'); }
+  const s = job.settings;
+  if (!s.sets && !s.drop) return toast('Enter a set code or a Secret Lair drop.');
+  const ctrl = startBusy('scan');
+  const signal = ctrl.signal;
+  const stages = s.voice
+    ? [['pool', 'Getting the card list', 6], ['voice', 'Listening for card names', 30], ['art', 'Downloading card pictures', 14], ['detect', 'Finding cards in the video', 48], ['merge', 'Matching what you said', 2]]
+    : [['pool', 'Getting the card list', 8], ['art', 'Downloading card pictures', 17], ['detect', 'Finding cards in the video', 75]];
+  const prog = makeProgress(stages);
+  job.status = 'scanning'; job.error = null; job.errorHTML = null;
+  await saveJob();
+  let where = 'pool';
+  try {
+    const data = need('data'), detect = need('detect');
+    const voice = s.voice ? need('voice') : null, vmatch = s.voice ? need('vmatch') : null;
+
+    prog.stage('pool', s.sets ? `set ${s.sets}${s.drop ? ' + ' + s.drop : ''}` : s.drop);
+    const fullPool = await data.buildPool({ sets: s.sets, drop: s.drop, onProgress: prog.cb, signal });
+    checkAbort(signal);
+    if (!fullPool?.length) throw new Friendly(`Scryfall didn’t return any cards for “${[s.sets, s.drop].filter(Boolean).join(' / ')}”. Check the set code or drop name.`);
+    pool = fullPool;
+
+    let artPool = fullPool, hits = [];
+    if (s.voice) {
+      where = 'voice';
+      prog.stage('voice', 'the first time, this downloads the speech model (about 80–150 MB)');
+      const heard = await voice.listen(file, fullPool, { onProgress: prog.cb, signal });
+      checkAbort(signal);
+      hits = heard?.hits || [];
+      const names = new Set(hits.map((h) => h.name));
+      if (hits.length && fullPool.length > BIG_POOL) {
+        artPool = fullPool.filter((r) => names.has(r.name));
+        prog.set(1, `searching art for just the ${names.size} card(s) you named (${artPool.length} printings instead of ${fullPool.length})`);
+      }
+    }
+
+    if (typeof data.ensureArt === 'function') {
+      where = 'art';
+      prog.stage('art', `${artPool.length} card pictures`);
+      await data.ensureArt(artPool, { onProgress: prog.cb, signal });
+      checkAbort(signal);
+    }
+
+    where = 'detect';
+    prog.stage('detect', '');
+    let events = await detect.detectCards(file, artPool, { skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal });
+    checkAbort(signal);
+
+    if (s.voice) {
+      where = 'merge';
+      prog.stage('merge', '');
+      events = vmatch.mergeVoice(events, hits, fullPool, { allowDupes: !!s.allowDupes });
+    }
+    prog.finish();
+    job.cards = normalizeEvents(events);
+    job.status = 'review';
+    job.output = null;
+    result = null; editing = false;
+    await saveJob();
+    askPersist();
+    toast(job.cards.length ? `Found ${job.cards.length} card${job.cards.length === 1 ? '' : 's'}` : 'No cards found');
+  } catch (e) {
+    console.error('scan failed', where, e);
+    if (e?.name === 'AbortError') {
+      job.status = job.cards.length ? 'review' : 'new';
+      job.error = null;
+      toast('Scan cancelled');
+    } else {
+      job.status = job.cards.length ? 'review' : 'error';
+      job.error = friendlyError(e, where, s);
+      job.errorHTML = errorHTML(e, where, s) + `<div class="hint">${job.cards.length ? 'Your previous card list is still below.' : ''}</div>`;
+    }
+    await saveJob();
+  } finally {
+    endBusy();
+    document.title = 'Pack Shorts';
+    drawJob();
+    if (job?.status === 'error' || job?.status === 'new') show('scanagain', !!file);
+  }
+}
+
+// ------------------------------------------------------------------ render
+async function runRender() {
+  if (busy || !job) return;
+  if (!okToDiscard()) return;
+  if (!file) { $('repick').scrollIntoView({ behavior: 'smooth', block: 'center' }); return toast('Choose the video again first.'); }
+  const o = readOptions();
+  if (!o) { $('opts').open = true; $('rtiers').focus(); return toast('Price tiers: up to 4 amounts like 1,5,20,50'); }
+  const events = (job.cards || []).filter((c) => c.include !== false).sort((a, b) => a.time_s - b.time_s);
+  if (!events.length && !confirm('No cards are included. Make the Short anyway?')) return;
+
+  const ctrl = startBusy('render');
+  const signal = ctrl.signal;
+  const prog = makeProgress([['check', 'Checking this phone', 2], ['render', 'Making your Short', 98]]);
+  job.status = 'rendering'; job.error = null; job.errorHTML = null;
+  try {
+    const render = need('render');
+    prog.stage('check');
+    const cap = await render.canRender();
+    if (!cap?.ok) throw new Friendly(`This phone can’t make the video: ${cap?.reason || 'no supported video encoder'}. Try updating Chrome.`);
+    let layout = job.settings.layout;
+    if (!layout) { try { layout = need('painter').defaultLayout(); } catch (e) { layout = { total: [40, 230], card: [540, 421] }; } }
+    job.settings = { ...DEFAULT_SETTINGS, ...job.settings, ...o, layout };
+    await saveJob();
+    prog.stage('render', `${cap.video || ''}${cap.audio ? ' + ' + cap.audio : ''}`);
+    const r = await render.renderShort(file, events, job.settings, {
+      signal,
+      onProgress: (p) => {
+        const n = normProgress(p);
+        const label = { audio: 'Mixing the sound', video: 'Drawing the overlays', mux: 'Saving the file', finish: 'Finishing' }[p?.stage] || '';
+        prog.cb({ fraction: n.fraction, message: n.message || label });
+      },
+    });
+    checkAbort(signal);
+    prog.finish();
+    result = r;
+    unsaved = true;
+    if (outURL) URL.revokeObjectURL(outURL);
+    outURL = URL.createObjectURL(r.blob);
+    job.status = 'done';
+    job.output = { extension: r.extension, mimeType: r.mimeType, size: r.blob.size, at: Date.now(), codec: r.codec || '' };
+    editing = false;
+    await saveJob();
+    showResult();
+  } catch (e) {
+    console.error('render failed', e);
+    job.status = 'review';
+    if (e?.name === 'AbortError') { job.error = null; toast('Cancelled'); } else {
+      job.error = friendlyError(e, 'render');
+      job.errorHTML = errorHTML(e, 'render');
+    }
+    await saveJob();
+  } finally {
+    endBusy();
+    document.title = 'Pack Shorts';
+    drawJob();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+}
+$('render').onclick = () => runRender();
+
+function outName() { return `${stem(job?.name)}_short.${result?.extension || 'mp4'}`; }
+
+function showResult() {
+  const v = $('out');
+  v.src = outURL;
+  const a = $('dl');
+  a.href = outURL;
+  a.download = outName();
+  $('outinfo').textContent = `${outName()} · ${mb(result.blob.size)}${result.codec ? ' · ' + result.codec : ''}`;
+  setPlatform(platform);
+}
+
+$('share').onclick = async () => {
+  if (!result) return;
+  const f = new File([result.blob], outName(), { type: result.mimeType || 'video/mp4' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [f] })) { await navigator.share({ files: [f], title: 'Pack opening' }); unsaved = false; return; }
+  } catch (e) { if (e.name === 'AbortError') return; }
+  $('dl').click();
+  toast('Sharing isn’t available here, so it was downloaded instead.');
+};
+
+$('dl').addEventListener('click', () => { unsaved = false; });
+$('edit').onclick = () => { editing = true; drawJob(); window.scrollTo(0, 0); };
+
+// ------------------------------------------------------------------ platforms
+function setPlatform(p) {
+  platform = PLATFORMS.some(([k]) => k === p) ? p : 'shorts';
+  prefs.platform = platform;
+  store.setPref('platform', platform);
+  $('omock').innerHTML = platformOverlay(platform);
+  editor?.setPlatform(platform);
+  document.querySelectorAll('[data-seg] button').forEach((b) => b.classList.toggle('on', b.dataset.p === platform));
+}
+document.querySelectorAll('[data-seg]').forEach((seg) => {
+  seg.innerHTML = PLATFORMS.map(([k, l]) => `<button type="button" data-p="${k}">${l}</button>`).join('');
+  seg.querySelectorAll('button').forEach((b) => { b.onclick = () => setPlatform(b.dataset.p); });
+});
+
+// ------------------------------------------------------------------ layout editor
+function topCard() {
+  const inc = (job?.cards || []).filter((c) => c.include !== false);
+  if (!inc.length) return { name: 'Card Name', price: 12.34, foil: false, usd: 12.34, usd_foil: null, time_s: 0 };
+  return inc.reduce((a, b) => (effectivePrice(b) > effectivePrice(a) ? b : a));
+}
+
+function refreshSprites() {
+  const painter = need('painter');
+  const tiers = makeTiers(readOptions()?.tiers || job.settings.tiers);
+  const top = topCard();
+  editor.setSprites(painter.totalSprite(totalOf(job.cards || [])), painter.cardSprite({ ...top, price: effectivePrice(top) }, tiers, { labels: !!job.settings.labels }));
+}
+
+let frameSeq = 0;
+async function setFrame() {
+  if (!editor) return;
+  if (!file) { editor.setFrame(null, 'Choose the video again to see it here'); return; }
+  const seq = ++frameSeq;
+  try {
+    const bmp = await need('frames').grabFrame(file, +$('lscrub').value, { width: 540, height: 960 });
+    if (seq !== frameSeq) { bmp?.close?.(); return; }
+    editor.setFrame(bmp);
+    bmp?.close?.();
+  } catch (e) {
+    console.warn('grabFrame failed', e);
+    if (seq === frameSeq) editor.setFrame(null, friendlyError(e, 'frame'));
+  }
+}
+
+async function openLayout() {
+  show('laybox', true); show('laybtn', false);
+  if (!editor) {
+    editor = new LayoutEditor($('lstage'), {
+      onEnd: async (layout) => {
+        job.settings.layout = layout;
+        prefs.layout = layout;
+        store.setPref('layout', layout);
+        await saveJob();
+      },
+    });
+  }
+  editor.setPlatform(platform);
+  try {
+    refreshSprites();
+    const layout = job.settings.layout || prefs.layout || need('painter').defaultLayout();
+    editor.setLayout(layout);
+  } catch (e) {
+    show('laybox', false); show('laybtn', true);
+    $('jstatus').innerHTML = errorHTML(e, 'layout');
+    return;
+  }
+  const dur = $('src').duration;
+  const top = topCard();
+  const max = Number.isFinite(dur) && dur > 0 ? dur - 0.1 : Math.max(10, ...(job.cards || []).map((c) => +c.time_s + 2));
+  $('lscrub').max = Math.max(1, max).toFixed(1);
+  $('lscrub').value = Math.min((+top.time_s || 0) + 0.6, max).toFixed(1);
+  setFrame();
+  $('laybox').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function closeLayout() { show('laybox', false); show('laybtn', true); }
+
+$('laybtn').onclick = () => openLayout();
+$('ldone').onclick = () => closeLayout();
+$('lreset').onclick = async () => {
+  const d = need('painter').defaultLayout();
+  editor.setLayout(d);
+  job.settings.layout = editor.getLayout();
+  prefs.layout = job.settings.layout;
+  store.setPref('layout', prefs.layout);
+  await saveJob();
+};
+$('lscrub').addEventListener('input', debounce(setFrame, 120));
+
+// ------------------------------------------------------------------ service worker + update banner
+let refreshing = false, wantReload = false;
+function registerSW() {
+  if (!('serviceWorker' in navigator) || params.has('nosw')) return;
+  navigator.serviceWorker.register('./sw.js').then((reg) => {
+    const offer = () => { if (reg.waiting && navigator.serviceWorker.controller) showUpdate(reg.waiting); };
+    offer();
+    reg.addEventListener('updatefound', () => {
+      const w = reg.installing;
+      w?.addEventListener('statechange', () => { if (w.state === 'installed') offer(); });
+    });
+    setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+  }).catch((e) => console.warn('service worker registration failed', e));
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!wantReload || refreshing) return;
+    refreshing = true;
+    location.reload();
+  });
+}
+function showUpdate(worker) {
+  show('update', true);
+  $('upd-go').onclick = () => {
+    if (busy) return toast('Wait until the current job finishes, then refresh.');
+    wantReload = true;
+    worker.postMessage({ type: 'SKIP_WAITING' });
+  };
+}
+
+function watchOnline() {
+  const upd = () => show('offline', !navigator.onLine);
+  addEventListener('online', upd); addEventListener('offline', upd); upd();
+}
+
+// ------------------------------------------------------------------ storage
+/** Ask once that the browser keep our caches (card art, models) instead of evicting them under pressure. */
+async function askPersist() {
+  if (prefs.persistAsked) return;
+  prefs.persistAsked = true;
+  store.setPref('persistAsked', true);
+  const ok = await store.persist();
+  console.info('persistent storage', ok ? 'granted' : 'not granted');
+  drawStorage();
+}
+
+async function drawStorage() {
+  const el = $('st-usage');
+  try {
+    const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
+    const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : false;
+    el.textContent = est
+      ? `Using ${(est.usage / 1048576).toFixed(1)} MB of ${(est.quota / 1048576).toFixed(0)} MB available${persisted ? ' · protected from automatic clean-up' : ''}.`
+      : 'Storage details aren’t available in this browser.';
+  } catch (e) { el.textContent = 'Storage details aren’t available in this browser.'; }
+}
+
+async function clearCaches(match, what) {
+  if (!('caches' in self)) return toast('Nothing to clear.');
+  if (!confirm(`Clear ${what}? It will be downloaded again when needed.`)) return;
+  const names = (await caches.keys()).filter(match);
+  await Promise.all(names.map((n) => caches.delete(n)));
+  toast(names.length ? `Cleared ${what}.` : `No ${what} stored.`);
+  drawStorage();
+}
+
+function bindStorage() {
+  $('storage').addEventListener('toggle', () => { if ($('storage').open) drawStorage(); });
+  $('st-art').onclick = () => clearCaches((n) => n.startsWith(ART_CACHE_PREFIX), 'cached card images');
+  $('st-model').onclick = () => clearCaches((n) => n === MODEL_CACHE_NAME, 'the speech model');
+}
+
+// ------------------------------------------------------------------ start
+async function main() {
+  $('n-fields').innerHTML = scanFieldsHTML('n', { pack: true });
+  $('r-fields').innerHTML = scanFieldsHTML('r', { pack: false });
+  show('demo', MOCK);
+  watchOnline();
+  registerSW();
+  addEventListener('appinstalled', askPersist);
+  bindStorage();
+
+  const [sets, voice, layout, plat, tiers, outro, sfx, persistAsked] = await Promise.all(
+    ['sets', 'voice', 'layout', 'platform', 'tiers', 'outro', 'sfx', 'persistAsked'].map((k) => store.getPref(k)));
+  prefs = { sets, voice, layout, platform: plat, tiers, outro, sfx, persistAsked };
+  platform = plat || 'shorts';
+
+  $('file').addEventListener('change', (e) => setPicked(e.target.files[0] || null));
+  ['n-sets', 'n-skip', 'n-pack'].forEach((id) => $(id).addEventListener('input', checkGo));
+  bindDropSearch('n', checkGo);
+  bindDropSearch('r');
+  $('go').onclick = () => startNewJob();
+
+  try { mods = await loadModules(); } catch (e) {
+    mods = { errors: { data: e } };
+    console.error(e);
+  }
+  showModuleErrors();
+  setPlatform(platform);
+  await route();
+  document.documentElement.dataset.ready = '1';
+}
+
+main();
+
+// exposed for tests and debugging
+window.packShorts = { get job() { return job; }, get busy() { return !!busy; }, get file() { return file; }, store, get mods() { return mods; } };
