@@ -427,7 +427,10 @@ function setVideo(f) {
 
 async function saveJob() {
   if (!job) return;
-  job = await store.putJob(job);
+  // Save a snapshot but keep the SAME in-memory job: the card rows' buttons hold references to its card objects,
+  // so replacing it with the stored copy made every edit after the first save land on a stale object.
+  const saved = await store.putJob(job);
+  if (saved && job && saved.id === job.id) job.updated = saved.updated;
 }
 
 function drawJob() {
