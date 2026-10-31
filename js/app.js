@@ -20,7 +20,7 @@ export const MODEL_CACHE_NAME = 'transformers-cache';   // Transformers.js speec
 const BIG_POOL = 600;
 // Phones run out of memory matching against thousands of artworks (each worker holds ~35 KB per artwork,
 // plus the video decoder). Above MAX_ART we stop and suggest narrowing; above ONE_WORKER_ART we use one worker.
-const MAX_ART = 2000;
+const MAX_ART = 3000;
 const ONE_WORKER_ART = 800;
 // With voice on, only sets bigger than this (e.g. The List, ~5000 cards) are cut down to the names you said.
 // Normal-size sets stay whole, so a card you didn't name (or that was misheard) can still be found by its art.
