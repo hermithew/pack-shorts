@@ -49,6 +49,7 @@ The app is small, but some things are downloaded the first time you need them an
 | Speech model for "Listen for card names I say" | ~80–150 MB | first time you use voice |
 | Card list and card pictures for a set | a few MB per set | first scan of that set (list refreshed daily, pictures kept) |
 | Secret Lair drop list | ~1 MB | first drop search (refreshed weekly) |
+| Working copy of the video you're working on | same size as the video | while you work on it (only the latest one is kept) |
 
 After that, the app opens and works offline for sets you've already scanned. Prices refresh when you're online.
 
@@ -64,7 +65,10 @@ cache and reloads. Card-art and speech-model caches are kept.
 
 - Your videos never leave your phone. Nothing is uploaded, and there's no server or account.
 - Card lists, settings and box positions are stored in the browser's storage on your phone. Delete a job from **Recent**
-  to remove it. Videos themselves are not copied: to re-make an old job, you'll be asked to pick the same video again.
+  to remove it.
+- When you pick a video, the app makes one private working copy of it inside its own storage on the phone. Android can
+  otherwise take away access to a picked video partway through a long job. Only the latest video is kept, and you can
+  delete it under **Storage on this phone**. For older jobs you'll be asked to pick the video again.
 - Network requests go only to Scryfall (card data and pictures), MTGJSON (Secret Lair drop names), and, if you use voice,
   jsDelivr and Hugging Face (speech recogniser and model).
 

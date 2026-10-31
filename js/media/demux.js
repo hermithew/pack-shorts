@@ -13,7 +13,21 @@ const dec2 = n => String(n).padStart(2, '0');
 
 /** Read bytes [a, b) of a Blob/File as a Uint8Array. */
 export async function readRange(file, a, b) {
-  return new Uint8Array(await file.slice(a, Math.min(b, file.size)).arrayBuffer());
+  // Android can briefly refuse reads of picked files (NotReadableError); retry a few times before giving up.
+  for (let attempt = 0; ; attempt++) {
+    try { return new Uint8Array(await file.slice(a, Math.min(b, file.size)).arrayBuffer()); }
+    catch (e) {
+      if (attempt >= 2 || e?.name === 'AbortError') {
+        if (e?.name === 'NotReadableError') {
+          const err = new Error('Your phone stopped letting the app read this video. Pick the video again '
+            + '(from the Files app if you used Gallery or Photos) and keep the app open while it works.');
+          err.name = 'VideoReadError'; err.cause = e; throw err;
+        }
+        throw e;
+      }
+      await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
+    }
+  }
 }
 
 class Box {

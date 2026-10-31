@@ -8,6 +8,7 @@
 
 import { makeTiers, tierFor, effectivePrice, fmtMoney, rgba, DEFAULT_TIERS, TIER_STYLES } from './tiers.js';
 import * as store from './store.js';
+import * as lc from './localcopy.js';
 import { LayoutEditor, PLATFORMS, platformOverlay } from './layout.js';
 
 const $ = (id) => document.getElementById(id);
@@ -283,6 +284,7 @@ async function drawJobs() {
     row.querySelector('.del').onclick = async () => {
       if (!confirm(`Delete “${j.name}”? Its card list and settings will be removed (your video isn’t touched).`)) return;
       await store.deleteJob(j.id);
+      if (await lc.getStaged(j.name, j.size)) await lc.clearStaged();
       drawJobs();
     };
     box.appendChild(row);
@@ -290,19 +292,54 @@ async function drawJobs() {
 }
 
 // ------------------------------------------------------------------ home: new job
-function setPicked(f) {
-  file = f;
+let staging = null;   // { ctrl } while a picked video is being copied into the app's private storage
+
+/**
+ * Copy a just-picked video into private storage (see localcopy.js) so Android can't revoke access mid-job.
+ * Shows progress in `metaEl`. Resolves to the File to use (the copy, or the original if copying isn't possible).
+ */
+async function stagePicked(f, metaEl) {
+  if (staging) staging.ctrl.abort();
+  const ctrl = new AbortController();
+  staging = { ctrl };
+  try {
+    const r = await lc.stageVideo(f, {
+      signal: ctrl.signal,
+      onProgress: (x) => { metaEl.textContent = `${mb(f.size)} · getting it ready… ${Math.round(x * 100)}%`; },
+    });
+    if (!r.staged) console.info('working copy not made:', r.reason);
+    metaEl.textContent = `${mb(f.size)} · ready${r.staged ? '' : (r.reason === 'space' ? ' (low storage — keep the app open while it works)' : '')}`;
+    return r.file;
+  } finally { if (staging?.ctrl === ctrl) staging = null; }
+}
+
+async function setPicked(f) {
+  file = null;
   const pick = $('pick');
   pick.classList.toggle('has', !!f);
   $('fname').textContent = f ? f.name : 'Choose your pack-opening video';
-  $('fmeta').textContent = f ? `${mb(f.size)} · tap to choose a different one` : 'Vertical works best. It stays on your phone.';
+  $('fmeta').textContent = f ? `${mb(f.size)} · getting it ready…` : 'Vertical works best. It stays on your phone.';
+  $('gostatus').textContent = '';
+  checkGo();
+  if (!f) return;
+  try {
+    const ready = await stagePicked(f, $('fmeta'));
+    if ($('fname').textContent !== f.name) return;          // picked something else meanwhile
+    file = ready;
+    $('fmeta').textContent += ' · tap to choose a different one';
+  } catch (e) {
+    if (e?.name === 'AbortError') return;
+    $('fmeta').textContent = `${mb(f.size)} · couldn’t be read`;
+    $('gostatus').innerHTML = `<span class="err">${esc(e?.message || String(e))}</span>`;
+  }
   checkGo();
 }
 
 function checkGo() {
   const s = readScanForm('n');
   $('go').disabled = !(file && (s.sets || s.drop));
-  $('gostatus').textContent = file && !(s.sets || s.drop) ? 'Enter a set code or pick a Secret Lair drop.' : '';
+  if (staging || !file) return;                  // keep copy progress / read errors visible
+  $('gostatus').textContent = !(s.sets || s.drop) ? 'Enter a set code or pick a Secret Lair drop.' : '';
 }
 
 async function startNewJob() {
@@ -355,7 +392,8 @@ async function openJob(id) {
   if (job?.id !== id) {
     const j = await store.getJob(id);
     if (!j) { toast('That job no longer exists.'); location.hash = ''; return; }
-    const keepFile = file && file.name === j.name && file.size === j.size ? file : null;
+    const keepFile = (file && file.name === j.name && file.size === j.size ? file : null)
+      || await lc.getStaged(j.name, j.size);
     if (!okToDiscard()) { location.hash = 'job=' + job.id; return; }
     job = j; pool = null; result = null; editing = false;
     if (outURL) { URL.revokeObjectURL(outURL); outURL = null; }
@@ -428,6 +466,7 @@ function drawJob() {
 $('refile').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   e.target.value = '';
+  await routeDone;                       // the job may still be opening
   if (!f || !job) return;
   if (f.name !== job.name || f.size !== job.size) {
     const ok = confirm(`This doesn’t look like the same video.\n\nExpected: ${job.name} (${mb(job.size)})\nChosen: ${f.name} (${mb(f.size)})\n\nUse it anyway? Card times may not line up.`);
@@ -435,7 +474,9 @@ $('refile').addEventListener('change', async (e) => {
     job.name = f.name; job.size = f.size; job.lastModified = f.lastModified; job.type = f.type;
     await saveJob();
   }
-  setVideo(f);
+  const note = $('jobmeta');
+  try { setVideo(await stagePicked(f, note)); }
+  catch (err) { if (err?.name !== 'AbortError') toast(err?.message || String(err)); }
   drawJob();
   if (editor && !$('laybox').hidden) setFrame();
 });
@@ -993,9 +1034,11 @@ async function drawStorage() {
   try {
     const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
     const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : false;
-    el.textContent = est
+    const vc = await lc.stagedUsage();
+    el.textContent = (est
       ? `Using ${(est.usage / 1048576).toFixed(1)} MB of ${(est.quota / 1048576).toFixed(0)} MB available${persisted ? ' · protected from automatic clean-up' : ''}.`
-      : 'Storage details aren’t available in this browser.';
+      : 'Storage details aren’t available in this browser.')
+      + (vc.count ? ` Includes a ${(vc.total / 1048576).toFixed(0)} MB working copy of your latest video.` : '');
   } catch (e) { el.textContent = 'Storage details aren’t available in this browser.'; }
 }
 
@@ -1012,6 +1055,13 @@ function bindStorage() {
   $('storage').addEventListener('toggle', () => { if ($('storage').open) drawStorage(); });
   $('st-art').onclick = () => clearCaches((n) => n.startsWith(ART_CACHE_PREFIX), 'cached card images');
   $('st-model').onclick = () => clearCaches((n) => n === MODEL_CACHE_NAME, 'the speech model');
+  $('st-video').onclick = async () => {
+    if (busy) return toast('Finish or cancel the current job first.');
+    if (!confirm('Delete the working copy of your latest video? Your original video isn’t touched; you’ll just need to pick it again to re-make that Short.')) return;
+    await lc.clearStaged();
+    toast('Working copy deleted.');
+    drawStorage();
+  };
 }
 
 // ------------------------------------------------------------------ start

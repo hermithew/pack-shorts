@@ -6,7 +6,7 @@
 // - Updates: bump VERSION. The new worker installs in the background and waits; the page shows
 //   "A new version of Pack Shorts is ready" and posts {type:'SKIP_WAITING'} when the user taps Refresh.
 
-const VERSION = 'v1';
+const VERSION = 'v2';
 const PREFIX = 'pack-shorts-app-';
 const CACHE = PREFIX + VERSION;
 
@@ -19,6 +19,7 @@ const CORE = [
   'js/app.js',
   'js/store.js',
   'js/layout.js',
+  'js/localcopy.js',
   'js/tiers.js',
   'icons/icon-192.png',
   'icons/icon-512.png',
