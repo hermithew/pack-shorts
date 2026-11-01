@@ -447,6 +447,40 @@ export async function findDrop(query, opts = {}) {
  * @returns {Promise<object[]>} CardRecord[]
  */
 // ------------------------------------------------------------------------------------------
+// Price fallback for printings Scryfall has no price for (common on The List)
+// ------------------------------------------------------------------------------------------
+
+export const PRICE_MAX_AGE_MS = 24 * 3600 * 1000;
+
+/**
+ * An estimated price for a card whose own printing has none. The List's numbers name the original printing
+ * ("2XM-17" = Double Masters #17): use that printing (same card, same art). Otherwise use Scryfall's default
+ * printing of the same name. Cached for a day.
+ * @returns {Promise<{usd:number|null, usd_foil:number|null, from:string}|null>}
+ */
+export async function fallbackPrice(card, { signal } = {}) {
+  const m = /^([A-Za-z0-9]{2,6})-([A-Za-z0-9★†]+)$/.exec(String(card.number || ''));
+  const tries = [];
+  if (m) tries.push({ url: `${CFG.scryfallBase}/cards/${encodeURIComponent(m[1].toLowerCase())}/${encodeURIComponent(m[2])}`, from: `${m[1].toUpperCase()} #${m[2]}` });
+  if (card.name) tries.push({ url: `${CFG.scryfallBase}/cards/named?exact=${encodeURIComponent(card.name)}`, from: '' });
+  for (const t of tries) {
+    const key = `price|${t.url}`;
+    const cached = await idbGet('kv', key);
+    if (cached && Date.now() - cached.fetched < PRICE_MAX_AGE_MS) { if (cached.usd != null || cached.usd_foil != null) return cached.v; continue; }
+    let r;
+    try { r = await politeFetch(t.url, { minGap: 120, tries: 3, signal }); }
+    catch (e) { if (isAbort(e)) throw e; continue; }
+    if (!r || !r.ok) { await idbPut('kv', { key, fetched: Date.now(), usd: null, usd_foil: null, v: null }); continue; }
+    const c = await r.json();
+    const v = { usd: _f(c?.prices?.usd), usd_foil: _f(c?.prices?.usd_foil) ?? _f(c?.prices?.usd_etched),
+      from: t.from || `${String(c?.set || '').toUpperCase()} #${c?.collector_number || ''}` };
+    await idbPut('kv', { key, fetched: Date.now(), usd: v.usd, usd_foil: v.usd_foil, v });
+    if (v.usd != null || v.usd_foil != null) return v;
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------------------------------
 // Packs (booster products): exact card lists per product
 // ------------------------------------------------------------------------------------------
 

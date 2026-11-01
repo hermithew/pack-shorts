@@ -465,6 +465,21 @@ async function openJob(id) {
   fillOptions(job.settings);
   closeLayout();
   drawJob();
+  backfillPrices();
+}
+
+/** Older jobs (scanned before price look-ups existed): quietly fill missing prices once a day. */
+async function backfillPrices() {
+  const j = job;
+  if (!j || busy || !(j.cards || []).some((c) => c.usd == null && c.usd_foil == null && c.price == null)) return;
+  if (j.pricesFilledAt && Date.now() - j.pricesFilledAt < 24 * 3600 * 1000) return;
+  let data;
+  try { data = need('data'); } catch (_) { return; }
+  const n = await fillMissingPrices(j.cards, data).catch(() => 0);
+  if (job !== j) return;
+  j.pricesFilledAt = Date.now();
+  await saveJob();
+  if (n) { drawJob(); toast(`Found prices for ${n} card${n === 1 ? '' : 's'}`); }
 }
 
 window.addEventListener('hashchange', route);
@@ -610,6 +625,7 @@ function drawCards() {
     el.innerHTML = `<button type="button" class="t" title="Jump to this moment">${(+c.time_s || 0).toFixed(1)}s</button>
       <div class="info"><div class="n"><span class="tierdot" style="background:${rgba(tier.outline)}" title="${esc(tier.top || tier.key)}"></span>${esc(c.name)}</div>
         <div class="sub">${esc(c.set || '')} ${c.number ? '#' + esc(c.number) : ''} ${esc(c.rarity || '')}</div>
+        ${c.price_from ? `<div class="badge">price from ${esc(c.price_from)} (this printing has none on Scryfall)</div>` : ''}
         ${badge(c, anyVoice)}
         ${alts.length ? `<div class="alts">same art: ${alts.map((a, i) => `<span>${esc(a.set)} #${esc(a.number)} ${a.usd != null ? fmtMoney(a.usd) : ''}</span><button type="button" data-alt="${i}">use this</button>`).join('')}</div>` : ''}
       </div>
@@ -800,8 +816,41 @@ function normalizeEvents(events) {
     usd_foil: e.usd_foil == null || e.usd_foil === '' ? null : +e.usd_foil, price: e.price == null || e.price === '' ? null : +e.price,
     include: e.include !== false && e.include !== '0', source: e.source || 'art', heard: e.heard || '',
     inliers: e.inliers == null || e.inliers === '' ? null : +e.inliers, alternates: Array.isArray(e.alternates) ? e.alternates : [],
-    scryfall_id: e.scryfall_id || '',
+    scryfall_id: e.scryfall_id || '', price_from: e.price_from || '',
   }));
+}
+
+/** Same card found twice within a few seconds (e.g. two List printings with the same art) -> one row. */
+function mergeNearDuplicates(cards, allowDupes) {
+  if (allowDupes) return cards;
+  const out = [];
+  for (const c of [...cards].sort((a, b) => a.time_s - b.time_s)) {
+    const twin = out.find((o) => o.name === c.name && Math.abs(o.time_s - c.time_s) < 3 && o.source !== 'manual' && c.source !== 'manual');
+    if (!twin) { out.push(c); continue; }
+    const keep = (c.inliers || 0) > (twin.inliers || 0) ? c : twin, drop = keep === c ? twin : c;
+    if (keep === c) out[out.indexOf(twin)] = c;
+    if (drop.heard && !keep.heard) { keep.heard = drop.heard; }
+    if (/voice/.test(drop.source) || /voice/.test(keep.source)) keep.source = keep.inliers != null || drop.inliers != null ? 'art+voice' : 'voice';
+    keep.foil = keep.foil || drop.foil;
+    const alt = { id: drop.scryfall_id, set: drop.set, number: drop.number, usd: drop.usd, usd_foil: drop.usd_foil };
+    if (drop.scryfall_id && !keep.alternates.some((a) => a.id === alt.id)) keep.alternates = [alt, ...keep.alternates];
+  }
+  return out;
+}
+
+/** Fill in prices Scryfall doesn't have for a printing (see data.fallbackPrice). */
+async function fillMissingPrices(cards, data, { onProgress, signal } = {}) {
+  if (typeof data.fallbackPrice !== 'function') return 0;
+  const missing = cards.filter((c) => c.usd == null && c.usd_foil == null);
+  let filled = 0;
+  for (let i = 0; i < missing.length; i++) {
+    onProgress?.(i / missing.length, `Looking up prices for ${missing.length} card${missing.length === 1 ? '' : 's'} without one (${i + 1}/${missing.length})`);
+    const c = missing[i];
+    let v = null;
+    try { v = await data.fallbackPrice(c, { signal }); } catch (e) { if (e?.name === 'AbortError') throw e; }
+    if (v) { c.usd = v.usd; c.usd_foil = v.usd_foil; c.price_from = v.from; filled++; }
+  }
+  return filled;
 }
 
 // ------------------------------------------------------------------ scan (ported from the original Python version detect())
@@ -899,10 +948,13 @@ async function runScan() {
       const byId = new Map(fullPool.map((r) => [r.id, r]));
       for (const e of events) if (byId.get(e.scryfall_id)?.foil_only) e.foil = true;
     }
+    let cards = mergeNearDuplicates(normalizeEvents(events), !!s.allowDupes);
+    await fillMissingPrices(cards, data, { signal, onProgress: (f, m) => prog.set(1, m) });
+    checkAbort(signal);
     prog.finish();
     clearInterval(crumb);
     job.lastStep = null;
-    job.cards = normalizeEvents(events);
+    job.cards = cards;
     job.status = 'review';
     job.output = null;
     result = null; editing = false;
