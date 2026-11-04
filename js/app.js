@@ -169,6 +169,8 @@ function scanFieldsHTML(p, { pack }) {
   <input id="${p}-booster" type="search" placeholder="e.g. Karlov Manor play, Zendikar Rising draft" autocomplete="off" spellcheck="false">
   <div class="results" id="${p}-boosterlist"></div>
   <div class="hint" id="${p}-boosterhint" hidden></div>
+  <label class="check" id="${p}-orderrow" hidden><input id="${p}-order" type="checkbox"> Cards come out in the pack’s printed order
+    <small>(faster and more accurate — e.g. Mystery Booster packs)</small></label>
   <label for="${p}-sets">…or set code(s)</label>
   <input id="${p}-sets" type="text" placeholder="e.g. dsk  or  dsk,spg  or  sld:1650-1660" autocapitalize="off" autocomplete="off" spellcheck="false">
   <label for="${p}-drop">…or a Secret Lair drop</label>
@@ -195,6 +197,7 @@ function readScanForm(p) {
   out.pack = b.value.trim() && b.value === b.dataset.name ? (b.dataset.code || '') : '';
   out.packName = out.pack ? b.dataset.name : '';
   out.packPer = out.pack ? +b.dataset.per || null : null;
+  out.packOrder = !!out.pack && $(`${p}-order`).checked;
   return out;
 }
 
@@ -206,12 +209,18 @@ function fillScanForm(p, s) {
   $(`${p}-dupes`).checked = !!s.allowDupes;
   if ($(`${p}-pack`)) $(`${p}-pack`).value = s.packPrice ?? '';
   setBooster(p, s.pack ? { code: s.pack, name: s.packName || s.pack, per: s.packPer } : null);
+  if (s.pack && s.packOrder != null) $(`${p}-order`).checked = !!s.packOrder;
 }
+
+/** Packs whose cards come out in a fixed sheet order (Mystery Boosters: white x3, blue x3 ... playtest). */
+const orderedByDefault = (code) => /^mb[c12]-|^mb1-/.test(String(code || ''));
 
 function setBooster(p, x) {
   const b = $(`${p}-booster`);
   b.value = x ? x.name : '';
   b.dataset.code = x ? x.code : ''; b.dataset.name = x ? x.name : ''; b.dataset.per = x?.per || '';
+  show(`${p}-orderrow`, !!x);
+  if (x) $(`${p}-order`).checked = orderedByDefault(x.code);
   const hint = $(`${p}-boosterhint`);
   hint.textContent = x ? `Uses the exact cards that can be in this pack${x.per ? ` (${x.per} cards per pack)` : ''}. Set codes below are ignored.` : '';
   show(hint, !!x);
@@ -930,10 +939,13 @@ async function runScan() {
 
     where = 'detect';
     prog.stage('detect', '');
+    // search plan hints: names you said (checked first around the moment you said them) and the pack's slot order
+    const order = s.pack && s.packOrder && typeof data.packOrder === 'function' ? await data.packOrder(s.pack).catch(() => null) : null;
+    const heardHints = hits.map((h) => ({ t: h.t, name: h.name }));
     let events;
     try {
       events = await detect.detectCards(file, artPool, {
-        skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal,
+        skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal, heard: heardHints, order,
         ...(nArt > ONE_WORKER_ART ? { workers: 1 } : {}),     // don't hold a big index twice
       });
     } finally { try { detect.disposeDetector?.(); } catch (_) { /* ignore */ } }   // free OpenCV before the next step

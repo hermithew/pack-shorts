@@ -489,7 +489,7 @@ let _packsMem = null;
 
 /** Compact product list: [{c: code, n: name, s: set name, src: [set codes], per: cards per pack, sh: {sheet: {f: foil, k: ['set:num', ...]}}}] */
 export async function loadPacks({ refresh = false, signal, onProgress } = {}) {
-  const key = `packs|${CFG.packsUrl}`;
+  const key = `packs2|${CFG.packsUrl}`;
   if (!refresh && _packsMem?.key === key && Date.now() - _packsMem.fetched < PACKS_MAX_AGE_MS) return _packsMem.packs;
   const cached = await idbGet('kv', key);
   if (cached && !refresh && Date.now() - cached.fetched < PACKS_MAX_AGE_MS) { _packsMem = cached; return cached.packs; }
@@ -515,7 +515,9 @@ export async function loadPacks({ refresh = false, signal, onProgress } = {}) {
       const keys = Object.keys(sheet.cards || {});
       sh[name] = { f: keys.length > 0 && keys.every(k => /:(foil|etched)$/.test(k)), k: keys.map(k => k.replace(/:(foil|etched)$/, '')) };
     }
-    packs.push({ c: p.code, n: p.name, s: p.set_name || '', src: p.source_set_codes || [], per, sh });
+    // slot order of the most common pack layout, e.g. [['white',3],['blue',3],...,['playtest',1]]
+    const sl = Object.entries(top.sheets || {});
+    packs.push({ c: p.code, n: p.name, s: p.set_name || '', src: p.source_set_codes || [], per, sh, sl });
   }
   if (!packs.length) { const err = new Error('The booster contents list was empty – its format may have changed.'); err.code = 'packs'; throw err; }
   const entry = { key, fetched: Date.now(), packs };
@@ -546,7 +548,16 @@ export async function searchPacks(query, limit = 12) {
 export async function packInfo(code) {
   const p = (await loadPacks()).find(x => x.c === code);
   if (!p) return null;
-  return { code: p.c, name: p.n, per: p.per, sets: p.src, sheets: Object.keys(p.sh) };
+  return { code: p.c, name: p.n, per: p.per, sets: p.src, sheets: Object.keys(p.sh), slots: p.sl || [] };
+}
+
+/** One sheet name per card in pack order, e.g. ['white','white','white','blue',...]. */
+export async function packOrder(code) {
+  const info = await packInfo(code);
+  if (!info) return null;
+  const out = [];
+  for (const [sheet, n] of info.slots) for (let i = 0; i < n; i++) out.push(sheet);
+  return out;
 }
 
 /**

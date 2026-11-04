@@ -200,9 +200,84 @@ async function videoDuration(file) {
  * @param {number} [opts.workers] parallel matcher workers (default 2 with >= 4 cores, else 1)
  * @returns {Promise<object[]>} CardEvent[] (source 'art'), sorted by time
  */
+// ------------------------------------------------------------------------------------------
+// Search plan: which cards each frame is compared with, cheapest first
+// ------------------------------------------------------------------------------------------
+
+const family = (sheet) => String(sheet || '').replace(/_foil$/, '');
+
+/**
+ * Builds, per frame, an ordered list of small searches ("passes"); the worker stops at the first pass that finds
+ * a card. 1) cards named out loud around this moment, 2) the card just seen, 3) the cards for the current slot of
+ * the pack (when the pack's cards come out in a fixed order), 4) the whole pool (always without a pack order,
+ * otherwise every few frames to recover from a missed or out-of-order card).
+ */
+export function makeSearchPlan(refs, { heard = [], order = null, fullEvery = 3 } = {}) {
+  const n = refs.length;
+  const byName = new Map();
+  refs.forEach((g, i) => { const k = g.rec.name; if (!byName.has(k)) byName.set(k, []); byName.get(k).push(i); });
+  const fams = refs.map((g) => new Set(g.members.flatMap((m) => (m.pack_sheets || []).map(family))));
+  const mask = (idx) => { const m = new Uint8Array(n); for (const i of idx) m[i] = 1; return m; };
+  const famMask = new Map();
+  const maskForFamilies = (list) => {
+    const key = [...new Set(list)].sort().join('|');
+    if (!famMask.has(key)) { const want = new Set(list); famMask.set(key, mask(refs.map((_, i) => i).filter((i) => [...fams[i]].some((f) => want.has(f))))); }
+    return famMask.get(key);
+  };
+  const ord = Array.isArray(order) && order.length ? order.map(family) : null;
+  const usable = ord && fams.some((f) => f.size);           // pool must know which sheet each card is on
+  const st = { pos: 0, dir: 0, cur: -1, curT: -1e9, pend: -1, pendN: 0, frame: 0, seen: new Set() };
+
+  function windowFamilies() {
+    if (st.dir === 0) return [...ord.slice(0, 2), ...ord.slice(-2)];          // which end does the pack start from?
+    const seq = st.dir > 0 ? ord : [...ord].reverse();
+    return seq.slice(st.pos, st.pos + 3);
+  }
+
+  return {
+    stats: { heardPasses: 0, trackPasses: 0, slotPasses: 0, fullPasses: 0 },
+    /** passes for a frame at time t (null = whole pool) */
+    passesFor(t) {
+      st.frame++;
+      const passes = [];
+      const named = [];
+      for (const h of heard) if (h.t >= t - 2 && h.t <= t + 8) for (const i of byName.get(h.name) || []) named.push(i);
+      if (named.length) { passes.push(mask(named)); this.stats.heardPasses++; }
+      if (st.cur >= 0 && t - st.curT < 2) { passes.push(mask([st.cur])); this.stats.trackPasses++; }
+      if (usable) {
+        const fam = windowFamilies();
+        if (fam.length) { passes.push(maskForFamilies(fam)); this.stats.slotPasses++; }
+        if (st.frame % fullEvery === 0 || !fam.length) { passes.push(null); this.stats.fullPasses++; }
+      } else { passes.push(null); this.stats.fullPasses++; }
+      return passes;
+    },
+    /** feed back what a frame found (best first) */
+    saw(t, refIdx) {
+      if (refIdx == null || refIdx < 0) return;
+      if (refIdx === st.cur) { st.curT = t; return; }
+      if (refIdx === st.pend) st.pendN++; else { st.pend = refIdx; st.pendN = 1; }
+      if (st.pendN < 2) return;                              // a new card needs two frames before we move on
+      st.cur = refIdx; st.curT = t; st.pend = -1; st.pendN = 0;
+      if (!usable || st.seen.has(refIdx)) return;
+      st.seen.add(refIdx);
+      const f = fams[refIdx];
+      if (st.dir === 0) {
+        const fwd = ord.slice(0, 2).some((x) => f.has(x)), back = ord.slice(-2).some((x) => f.has(x));
+        st.dir = back && !fwd ? -1 : 1;
+      }
+      const seq = st.dir > 0 ? ord : [...ord].reverse();
+      let k = -1;
+      for (let i = st.pos; i < Math.min(seq.length, st.pos + 3); i++) if (f.has(seq[i])) { k = i; break; }
+      if (k < 0) for (let i = 0; i < seq.length; i++) if (f.has(seq[i]) && i >= st.pos - 1) { k = i; break; }   // re-sync
+      st.pos = k >= 0 ? k + 1 : st.pos + 1;
+    },
+  };
+}
+
 export async function detectCards(file, pool, {
   sampleFps = 6, skipStart = 0, minInliers = 14, minHits = 2, allowDupes = false, dupeGap = 8,
   frames, duration, onProgress, onFrame, signal, lsh, workers = defaultWorkerCount(),
+  heard = [], order = null,
 } = {}) {
   if (!pool || !pool.length) throw new Error('No cards to look for – pick a set first.');
   const emit = (p) => { try { onProgress?.(p); } catch (_) { /* ignore UI errors */ } };
@@ -262,6 +337,23 @@ export async function detectCards(file, pool, {
       source = sampleFrames(file, { fps: sampleFps, width: 720, height: 1280, fit: 'pad', startAt: skipStart, signal });
     }
     const hits = [];
+    const plan = makeSearchPlan(refs, { heard, order });
+    // Frames that look almost the same as the last one reuse its result instead of being searched again.
+    let prevSig = null, prevFound = null, prevT = -1, reused = 0;
+    const sigOf = (img) => {
+      if (!(typeof ImageData !== 'undefined' && img instanceof ImageData)) return null;
+      const W = 24, H = 42, out = new Float32Array(W * H), d = img.data, iw = img.width, ih = img.height;
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        let acc = 0;
+        for (let yy = 0; yy < 3; yy++) for (let xx = 0; xx < 3; xx++) {
+          const px = Math.floor((x + (xx + 0.5) / 3) * iw / W), py = Math.floor((y + (yy + 0.5) / 3) * ih / H);
+          const o = (py * iw + px) * 4; acc += d[o] * 0.3 + d[o + 1] * 0.59 + d[o + 2] * 0.11;
+        }
+        out[y * W + x] = acc / 9;
+      }
+      return out;
+    };
+    const sigDiff = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; };
     const inflight = new Set();
     let lastT = 0;
     const handle = (r) => {
@@ -269,6 +361,10 @@ export async function detectCards(file, pool, {
       stats.frameMs += r.ms; stats.orbMs += r.orbMs || 0; stats.knnMs += r.knnMs || 0;
       stats.candidates = (stats.candidates || 0) + (r.candidates || 0); stats.queries = (stats.queries || 0) + (r.kps || 0);
       for (const [o, inl] of r.found) hits.push({ t: r.t, ref: o, inliers: inl });
+      if (r.t >= prevT) { prevT = r.t; prevFound = r.found; }
+      plan.saw(r.t, r.found.length ? r.found[0][0] : -1);
+      stats.passHits = stats.passHits || [0, 0, 0, 0, 0, 0];
+      if (r.found.length) stats.passHits[Math.min(5, r.pass || 0)]++;
       if (onFrame) {
         try { onFrame({ t: r.t, ms: r.ms, kps: r.kps, found: r.found.map(([o, inl]) => ({ ref: o, name: refs[o].rec.name, inliers: inl })) }); } catch (_) { /* debug only */ }
       }
@@ -280,10 +376,23 @@ export async function detectCards(file, pool, {
       const bmp = fr.bitmap ?? fr.imageData ?? fr.frame;
       if (ft < skipStart) { bmp?.close?.(); continue; }
       const isImageData = typeof ImageData !== 'undefined' && bmp instanceof ImageData;
+      const sig = sigOf(bmp);
+      if (sig && prevSig && prevFound && inflight.size === 0 && sigDiff(sig, prevSig) < 2.5) {
+        // nothing moved: same cards as the last frame (reuse at most ~1 s in a row, then look again)
+        if (reused < sampleFps) {
+          reused++; stats.reusedFrames = (stats.reusedFrames || 0) + 1;
+          for (const [o, inl] of prevFound) hits.push({ t: ft, ref: o, inliers: inl });
+          prevT = ft; lastT = ft;
+          continue;
+        }
+      }
+      reused = 0;
+      if (sig) prevSig = sig;
       const transfer = isImageData ? [bmp.data.buffer] : [bmp];
       const w = pool_.reduce((a, b) => (b.busy < a.busy ? b : a));
       w.busy++;
-      const p = w.call(isImageData ? { type: 'frame', t: ft, imageData: bmp, minInliers } : { type: 'frame', t: ft, bitmap: bmp, minInliers }, transfer)
+      const passes = plan.passesFor(ft);
+      const p = w.call(isImageData ? { type: 'frame', t: ft, imageData: bmp, minInliers, passes } : { type: 'frame', t: ft, bitmap: bmp, minInliers, passes }, transfer)
         .then(handle);
       inflight.add(p);
       p.finally(() => { w.busy--; inflight.delete(p); }).catch(() => {});
@@ -301,6 +410,7 @@ export async function detectCards(file, pool, {
     stats.totalMs = performance.now() - T0;
     stats.msPerFrame = stats.frames ? stats.frameMs / stats.frames : 0;
     stats.rawHits = hits.length;
+    stats.plan = plan.stats;
     lastDetectStats = stats;
     return events;
   } catch (e) {

@@ -249,8 +249,9 @@ let seen = null, stamp = 0;
  * For each query descriptor: up to KNN nearest reference descriptors among LSH candidates.
  * Returns flat arrays: nnIdx[q*KNN + r], nnDist[...] (-1 = none).
  */
-function knn(qdesc, nq) {
+function knn(qdesc, nq, allow = null) {
   const { desc32, lsh, n } = index;
+  const own = index.owner;
   const q32 = new Uint32Array(qdesc.buffer, qdesc.byteOffset, nq * 8);
   const nnIdx = new Int32Array(nq * KNN).fill(-1);
   const nnDist = new Int32Array(nq * KNN).fill(1 << 30);
@@ -273,6 +274,7 @@ function knn(qdesc, nq) {
           const j = T.items[s];
           if (seen[j] === stamp) continue;
           seen[j] = stamp;
+          if (allow && !allow[own[j]]) continue;          // only the cards allowed for this pass
           candidates++;
           const o = j * 8;
           const d = popcnt(a0 ^ desc32[o]) + popcnt(a1 ^ desc32[o + 1]) + popcnt(a2 ^ desc32[o + 2]) +
@@ -355,6 +357,7 @@ async function buildIndex(msg) {
   const owner = new Int32Array(n);
   const pts = new Float32Array(n * 2);
   const dims = refs.map(() => ({ w: 0, h: 0 }));
+  const rStart = new Int32Array(refs.length), rCount = new Int32Array(refs.length);
   let at = 0;
   for (let i = 0; i < feats.length; i++) {
     if (!ok[i]) continue;
@@ -363,13 +366,14 @@ async function buildIndex(msg) {
     desc.set(f.desc, at * 32);
     pts.set(f.pts, at * 2);
     owner.fill(i, at, at + f.n);
+    rStart[i] = at; rCount[i] = f.n;
     at += f.n;
   }
   const t1 = performance.now();
   const nTables = lshOpt.tables || LSH_TABLES, nBits = lshOpt.bits || lshBitsFor(n);
   const lsh = buildLsh(desc, n, nTables, nBits);
   const lshMs = performance.now() - t1;
-  index = { sig, ok, refs: dims, lshShape: [nTables, nBits], n, desc, desc32: new Uint32Array(desc.buffer), owner, pts, lsh };
+  index = { sig, ok, refs: dims, lshShape: [nTables, nBits], n, desc, desc32: new Uint32Array(desc.buffer), owner, pts, lsh, rStart, rCount };
   post({ type: 'indexed', id, ok, refs: ok.filter(Boolean).length, features: n, built, cached: fromCache,
     buildMs, msPerBuilt: built ? buildMs / built : 0, lshMs, lsh: [nTables, nBits] });
 }
@@ -411,15 +415,73 @@ function saneHomography(H, rw, rh, fw, fh) {
   return rel > 0.5 && rel < 2.0;
 }
 
-function matchFrame(img, minInliers = 14, maxCards = 4) {
+/**
+ * passes: list of Uint8Array masks over refs (null = every card). ORB runs once; each pass searches only its
+ * cards and the first pass that finds something wins (e.g. [the card just seen], then [this slot's sheet]).
+ */
+function matchFrame(img, minInliers = 14, maxCards = 4, passes = [null]) {
   const tm = { t0: performance.now() };
   const gray = prep(img);
   let f;
   try { f = orbFeatures(gray, orbFrame); } finally { gray.delete(); }
   tm.orb = performance.now() - tm.t0;
   if (f.n < 30 || !index || !index.n) return { found: [], kps: f.n, tm };
-  const { nnIdx, nnDist, candidates } = knn(f.desc, f.n);
-  tm.knn = performance.now() - tm.t0 - tm.orb;
+  let candidates = 0;
+  for (let pi = 0; pi < passes.length; pi++) {
+    const r = matchPass(img, f, minInliers, maxCards, passes[pi]);
+    candidates += r.candidates;
+    if (r.found.length || pi === passes.length - 1) {
+      tm.knn = r.knnMs; tm.total = performance.now() - tm.t0;
+      return { found: r.found, kps: f.n, candidates, pass: pi, tm };
+    }
+  }
+}
+
+/**
+ * Direct comparison against a few cards (the one just seen, the ones you named): no lookup tables, just every
+ * descriptor of those cards. Ratio test against the second-best match (classic Lowe test).
+ */
+function knnSmall(qdesc, nq, refList) {
+  const { desc32, rStart, rCount } = index;
+  const q32 = new Uint32Array(qdesc.buffer, qdesc.byteOffset, nq * 8);
+  const nnIdx = new Int32Array(nq * KNN).fill(-1);
+  const nnDist = new Int32Array(nq * KNN).fill(1 << 30);
+  let candidates = 0;
+  for (let q = 0; q < nq; q++) {
+    const qo = q * 8;
+    const a0 = q32[qo], a1 = q32[qo + 1], a2 = q32[qo + 2], a3 = q32[qo + 3],
+      a4 = q32[qo + 4], a5 = q32[qo + 5], a6 = q32[qo + 6], a7 = q32[qo + 7];
+    let b0 = 1 << 30, b1 = 1 << 30, j0 = -1, j1 = -1;
+    for (const r of refList) {
+      const end = rStart[r] + rCount[r];
+      for (let j = rStart[r]; j < end; j++) {
+        const o = j * 8;
+        const d = popcnt(a0 ^ desc32[o]) + popcnt(a1 ^ desc32[o + 1]) + popcnt(a2 ^ desc32[o + 2]) +
+          popcnt(a3 ^ desc32[o + 3]) + popcnt(a4 ^ desc32[o + 4]) + popcnt(a5 ^ desc32[o + 5]) +
+          popcnt(a6 ^ desc32[o + 6]) + popcnt(a7 ^ desc32[o + 7]);
+        if (d < b1) { if (d < b0) { b1 = b0; j1 = j0; b0 = d; j0 = j; } else { b1 = d; j1 = j; } }
+      }
+      candidates += rCount[r];
+    }
+    const base = q * KNN;
+    nnIdx[base] = j0; nnDist[base] = b0;
+    if (KNN > 1) { nnIdx[base + 1] = j1; nnDist[base + 1] = b1; }
+  }
+  return { nnIdx, nnDist, candidates, sameOwnerRatio: true };
+}
+
+const SMALL_PASS = 12;     // up to this many cards: compare directly instead of using the lookup tables
+
+function matchPass(img, f, minInliers, maxCards, allow) {
+  const t0 = performance.now();
+  let refList = null;
+  if (allow) {
+    refList = [];
+    for (let i = 0; i < allow.length && refList.length <= SMALL_PASS; i++) if (allow[i]) refList.push(i);
+    if (refList.length > SMALL_PASS) refList = null;
+  }
+  const { nnIdx, nnDist, candidates, sameOwnerRatio } = refList ? knnSmall(f.desc, f.n, refList) : knn(f.desc, f.n, allow);
+  const knnMs = performance.now() - t0;
   const owner = index.owner;
   const votes = new Map();
   for (let q = 0; q < f.n; q++) {
@@ -428,7 +490,8 @@ function matchFrame(img, minInliers = 14, maxCards = 4) {
     if (j0 < 0) continue;
     const o = owner[j0], d0 = nnDist[b];
     let d1 = -1;
-    for (let r = 1; r < KNN; r++) {
+    if (sameOwnerRatio) d1 = nnIdx[b + 1] >= 0 ? nnDist[b + 1] : -1;
+    else for (let r = 1; r < KNN; r++) {
       const j = nnIdx[b + r];
       if (j < 0) break;
       if (owner[j] !== o) { d1 = nnDist[b + r]; break; }
@@ -469,8 +532,7 @@ function matchFrame(img, minInliers = 14, maxCards = 4) {
     }
     if (found.length >= maxCards) break;
   }
-  tm.total = performance.now() - tm.t0;
-  return { found, kps: f.n, candidates, tm };
+  return { found, candidates, knnMs };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -491,8 +553,9 @@ self.onmessage = async (ev) => {
       const src = msg.bitmap || msg.imageData;
       let img;
       try { img = rgbaOf(src); } finally { if (src && typeof src.close === 'function') src.close(); }
-      const r = matchFrame(img, msg.minInliers ?? 14, msg.maxCards ?? 4);
-      post({ type: 'result', id: msg.id, t: msg.t, found: r.found, kps: r.kps, candidates: r.candidates || 0,
+      const passes = Array.isArray(msg.passes) && msg.passes.length ? msg.passes : [null];
+      const r = matchFrame(img, msg.minInliers ?? 14, msg.maxCards ?? 4, passes);
+      post({ type: 'result', id: msg.id, t: msg.t, found: r.found, kps: r.kps, candidates: r.candidates || 0, pass: r.pass ?? 0,
         ms: r.tm.total ?? (performance.now() - r.tm.t0), orbMs: r.tm.orb, knnMs: r.tm.knn || 0 });
     } else if (msg.type === 'clearCache') {
       const d = await db();
