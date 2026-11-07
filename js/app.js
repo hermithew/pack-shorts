@@ -43,7 +43,7 @@ let unsaved = false;      // a finished video exists that hasn't been downloaded
 /** Ask before throwing away a finished video that was never saved. Returns true if it's OK to continue. */
 function okToDiscard() {
   if (!result || !unsaved) return true;
-  if (!confirm('You haven’t saved the finished video yet. The app doesn’t keep it, so it will be gone (you can re-make it later from this job).\n\nLeave anyway?')) return false;
+  if (!confirm('The finished video couldn’t be kept in the app (not enough space?) and you haven’t downloaded it yet, so it will be gone (you can re-make it later from this job).\n\nLeave anyway?')) return false;
   unsaved = false;
   return true;
 }
@@ -326,6 +326,7 @@ const STATUS_LABEL = { new: 'new', scanning: 'interrupted', rendering: 'interrup
 
 async function drawJobs() {
   const jobs = await store.listJobs();
+  lc.deleteOutputs({ keepIds: jobs.map((j) => j.id) });      // saved Shorts of jobs that were trimmed away
   show('s-jobs', jobs.length > 0);
   const box = $('jobs');
   box.innerHTML = '';
@@ -344,6 +345,7 @@ async function drawJobs() {
     row.querySelector('.del').onclick = async () => {
       if (!confirm(`Delete “${j.name}”? Its card list and settings will be removed (your video isn’t touched).`)) return;
       await store.deleteJob(j.id);
+      await lc.deleteOutputs({ jobId: j.id });
       if (await lc.getStaged(j.name, j.size)) await lc.clearStaged();
       drawJobs();
     };
@@ -468,6 +470,15 @@ async function openJob(id) {
       job.lastStep = null;
       await saveJob();
     }
+    if (job.status === 'done' && job.output?.kept) {
+      const blob = await lc.getOutput(job.id, job.output.size, job.output.mimeType);
+      if (blob && job?.id === j.id) {
+        result = { blob, mimeType: job.output.mimeType, extension: job.output.extension, codec: job.output.codec || '' };
+        outURL = URL.createObjectURL(blob);
+        unsaved = false;
+        showResult();
+      }
+    }
   }
   show('v-home', false); show('v-job', true);
   window.scrollTo(0, 0);
@@ -525,8 +536,8 @@ function drawJob() {
   let st = '';
   if (isBusy) st = '';
   else if (job.error) st = job.errorHTML || `<span class="err">${esc(job.error)}</span>`;
-  else if (done) st = 'Done! Watch it, then download or share.';
-  else if (showReview) st = hasCards ? 'Check the cards below.' : 'No cards yet.';
+  else if (done) st = job.output?.kept ? 'Done! It’s saved in the app — download or share it whenever you like.' : 'Done! Watch it, then download or share.';
+  else if (showReview) st = hasCards ? `Check the cards below.${job.status === 'review' && job.scannedAt ? ' <span class="saved">✓ Saved — you can close the app and come back.</span>' : ''}` : 'No cards yet.';
   else st = file ? 'Ready to find the cards.' : '';
   $('jstatus').innerHTML = st;
   show('jprog', isBusy);
@@ -535,7 +546,7 @@ function drawJob() {
 
   // re-pick prompt when the video isn't in memory
   show('repick', !file && !isBusy);
-  $('repickmsg').innerHTML = `Videos aren’t stored by the app. To ${hasCards ? 'make the Short' : 'find the cards'}, choose the same video again: <b>${esc(job.name)}</b> (${mb(job.size)}).`;
+  $('repickmsg').innerHTML = `The app only keeps a copy of your latest video. To ${hasCards ? 'make the Short' : 'find the cards'}, choose the same video again: <b>${esc(job.name)}</b> (${mb(job.size)}).`;
 
   show('s-review', showReview);
   show('totalbar', showReview);
@@ -930,22 +941,21 @@ async function runScan() {
       }
     }
 
-    if (typeof data.ensureArt === 'function') {
-      where = 'art';
-      prog.stage('art', `${artPool.length} card pictures`);
-      await data.ensureArt(artPool, { onProgress: prog.cb, signal });
-      checkAbort(signal);
-    }
-
-    where = 'detect';
-    prog.stage('detect', '');
+    // pictures: detectCards only downloads what it has no saved matching data for (one per artwork)
+    where = 'art';
+    prog.stage('art', `${artCount(artPool).toLocaleString()} artworks`);
+    let inDetect = false;
+    const detectProgress = (p) => {
+      if (!inDetect && p?.stage && p.stage !== 'art') { inDetect = true; where = 'detect'; prog.stage('detect', ''); }
+      prog.cb(p);
+    };
     // search plan hints: names you said (checked first around the moment you said them) and the pack's slot order
     const order = s.pack && s.packOrder && typeof data.packOrder === 'function' ? await data.packOrder(s.pack).catch(() => null) : null;
     const heardHints = hits.map((h) => ({ t: h.t, name: h.name }));
     let events;
     try {
       events = await detect.detectCards(file, artPool, {
-        skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: prog.cb, signal, heard: heardHints, order,
+        skipStart: s.skipStart || 0, allowDupes: !!s.allowDupes, onProgress: detectProgress, signal, heard: heardHints, order,
         ...(nArt > ONE_WORKER_ART ? { workers: 1 } : {}),     // don't hold a big index twice
       });
     } finally { try { detect.disposeDetector?.(); } catch (_) { /* ignore */ } }   // free OpenCV before the next step
@@ -961,6 +971,15 @@ async function runScan() {
       for (const e of events) if (byId.get(e.scryfall_id)?.foil_only) e.foil = true;
     }
     let cards = mergeNearDuplicates(normalizeEvents(events), !!s.allowDupes);
+    // save what was found right away, so a crash or the phone closing the app during the price look-ups loses nothing
+    job.cards = cards; job.status = 'review'; job.output = null; job.scannedAt = Date.now();
+    await saveJob();
+    lc.deleteOutputs({ jobId: job.id });
+    job.status = 'scanning';
+    if (typeof data.refreshPrices === 'function') {
+      prog.set(1, 'Getting today’s prices for the cards found…');
+      await data.refreshPrices(cards, { signal }).catch((e) => { if (e?.name === 'AbortError') throw e; console.warn('price refresh failed', e); });
+    }
     await fillMissingPrices(cards, data, { signal, onProgress: (f, m) => prog.set(1, m) });
     checkAbort(signal);
     prog.finish();
@@ -972,7 +991,7 @@ async function runScan() {
     result = null; editing = false;
     await saveJob();
     askPersist();
-    toast(job.cards.length ? `Found ${job.cards.length} card${job.cards.length === 1 ? '' : 's'}` : 'No cards found');
+    toast(job.cards.length ? `Found ${job.cards.length} card${job.cards.length === 1 ? '' : 's'} · saved` : 'No cards found');
   } catch (e) {
     console.error('scan failed', where, e);
     clearInterval(crumb);
@@ -1030,11 +1049,13 @@ async function runRender() {
     checkAbort(signal);
     prog.finish();
     result = r;
-    unsaved = true;
     if (outURL) URL.revokeObjectURL(outURL);
     outURL = URL.createObjectURL(r.blob);
+    prog.cb({ fraction: 1, message: 'Keeping a copy in the app…' });
+    const kept = await lc.saveOutput(job.id, r.blob);
+    unsaved = !kept;
     job.status = 'done';
-    job.output = { extension: r.extension, mimeType: r.mimeType, size: r.blob.size, at: Date.now(), codec: r.codec || '' };
+    job.output = { extension: r.extension, mimeType: r.mimeType, size: r.blob.size, at: Date.now(), codec: r.codec || '', kept };
     editing = false;
     await saveJob();
     showResult();
@@ -1064,6 +1085,9 @@ function showResult() {
   a.href = outURL;
   a.download = outName();
   $('outinfo').textContent = `${outName()} · ${mb(result.blob.size)}${result.codec ? ' · ' + result.codec : ''}`;
+  $('outkept').textContent = job?.output?.kept
+    ? 'This video is kept in the app with this job until you delete the job or re-make it.'
+    : 'The app couldn’t keep a copy of this video (not enough space?) — download or share it before you leave.';
   setPlatform(platform);
 }
 
@@ -1219,26 +1243,94 @@ async function drawStorage() {
     const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
     const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : false;
     const vc = await lc.stagedUsage();
+    const oc = await lc.outputsUsage();
     el.textContent = (est
       ? `Using ${(est.usage / 1048576).toFixed(1)} MB of ${(est.quota / 1048576).toFixed(0)} MB available${persisted ? ' · protected from automatic clean-up' : ''}.`
       : 'Storage details aren’t available in this browser.')
-      + (vc.count ? ` Includes a ${(vc.total / 1048576).toFixed(0)} MB working copy of your latest video.` : '');
+      + (vc.count ? ` Includes a ${(vc.total / 1048576).toFixed(0)} MB working copy of your latest video.` : '')
+      + (oc.count ? ` ${oc.count} finished Short${oc.count === 1 ? '' : 's'}: ${(oc.total / 1048576).toFixed(0)} MB.` : '');
+    show('st-protect', !!navigator.storage?.persisted && !persisted);
   } catch (e) { el.textContent = 'Storage details aren’t available in this browser.'; }
 }
 
+/**
+ * "Download ahead": for some sets or packs, get the card lists now and turn the pictures into matching data,
+ * keeping only the matching data (about 20 KB per artwork). Later scans of those cards download nothing.
+ */
+let preBusy = null;
+async function preDownload() {
+  const msg = $('st-premsg');
+  if (preBusy) { preBusy.abort(); return; }
+  const items = $('st-presets').value.split(',').map((x) => x.trim()).filter(Boolean);
+  if (!items.length) { msg.textContent = 'Type one or more set codes or pack names first.'; return; }
+  if (busy) { msg.textContent = 'Finish or cancel the current job first.'; return; }
+  let data, detect;
+  try { data = need('data'); detect = need('detect'); } catch (e) { msg.textContent = String(e?.message || e); return; }
+  const ctrl = new AbortController();
+  preBusy = ctrl;
+  $('st-pre').textContent = 'Stop';
+  const done = [];
+  let artworks = 0, failed = 0;
+  try {
+    for (const item of items) {
+      let label = item.toUpperCase(), pool;
+      const say = (p) => { msg.textContent = `${label}: ${p?.message || '…'}`; };
+      if (/^[a-z0-9]{2,6}(:[\w-]+)?$/i.test(item)) {
+        pool = await data.buildPool({ sets: item, onProgress: say, signal: ctrl.signal });
+      } else {
+        const hit = (await data.searchPacks(item, 1))[0];
+        if (!hit) throw new Error(`no set or pack called “${item}”`);
+        label = hit.name;
+        pool = await data.buildPool({ pack: hit.code, onProgress: say, signal: ctrl.signal });
+      }
+      const r = await detect.prepareCards(pool, { onProgress: say, signal: ctrl.signal });
+      artworks += r.artworks; failed += r.failed;
+      done.push(label);
+    }
+    msg.textContent = `Ready: ${done.join(', ')} · ${artworks.toLocaleString()} artworks${failed ? ` (${failed} couldn’t be downloaded)` : ''}.`;
+    store.persist();
+  } catch (e) {
+    msg.textContent = e?.name === 'AbortError'
+      ? `Stopped.${done.length ? ` Ready: ${done.join(', ')}.` : ''} What was downloaded is kept.`
+      : `Stopped: ${e?.message || e}`;
+  } finally {
+    preBusy = null;
+    $('st-pre').textContent = 'Download';
+    drawStorage();
+  }
+}
+
 async function clearCaches(match, what) {
-  if (!('caches' in self)) return toast('Nothing to clear.');
-  if (!confirm(`Clear ${what}? It will be downloaded again when needed.`)) return;
+  if (!('caches' in self)) { toast('Nothing to clear.'); return true; }
+  if (!confirm(`Clear ${what}? It will be downloaded again when needed.`)) return false;
   const names = (await caches.keys()).filter(match);
   await Promise.all(names.map((n) => caches.delete(n)));
   toast(names.length ? `Cleared ${what}.` : `No ${what} stored.`);
   drawStorage();
+  return true;
 }
 
 function bindStorage() {
   $('storage').addEventListener('toggle', () => { if ($('storage').open) drawStorage(); });
-  $('st-art').onclick = () => clearCaches((n) => n.startsWith(ART_CACHE_PREFIX), 'cached card images');
+  $('st-art').onclick = async () => {
+    if (busy || preBusy) return toast('Finish or cancel the current job first.');
+    if (!await clearCaches((n) => n.startsWith(ART_CACHE_PREFIX), 'card pictures and matching data')) return;
+    try { need('detect').disposeDetector?.(); } catch (_) { /* ignore */ }
+    await new Promise((res) => { try { const r = indexedDB.deleteDatabase('pack-shorts-orb'); r.onsuccess = r.onerror = r.onblocked = res; } catch (_) { res(); } });
+    drawStorage();
+  };
   $('st-model').onclick = () => clearCaches((n) => n === MODEL_CACHE_NAME, 'the speech model');
+  $('st-shorts').onclick = async () => {
+    if (busy) return toast('Finish or cancel the current job first.');
+    if (!confirm('Delete every finished Short kept in the app? Download any you still need first. Your jobs and card lists stay, so you can re-make them.')) return;
+    await lc.deleteOutputs();
+    const jobs = await store.listJobs();
+    for (const j of jobs) if (j.output?.kept) { j.output.kept = false; await store.putJob(j); }
+    if (job?.output?.kept) { job.output.kept = false; result = null; }
+    toast('Saved Shorts deleted.');
+    drawStorage();
+  };
+  $('st-pre').onclick = () => preDownload();
   $('st-video').onclick = async () => {
     if (busy) return toast('Finish or cancel the current job first.');
     if (!confirm('Delete the working copy of your latest video? Your original video isn’t touched; you’ll just need to pick it again to re-make that Short.')) return;
@@ -1256,6 +1348,9 @@ async function main() {
   watchOnline();
   registerSW();
   addEventListener('appinstalled', askPersist);
+  // Chromium grants this silently to installed or often-used apps, and it's what stops card lists and pictures
+  // being cleared when the phone runs low on space. Ask again on each start until it's granted.
+  navigator.storage?.persisted?.().then((ok) => { if (!ok) store.persist().then(() => drawStorage()); }).catch(() => {});
   bindStorage();
 
   const [sets, voice, layout, plat, tiers, outro, sfx, persistAsked, pack] = await Promise.all(

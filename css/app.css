@@ -262,3 +262,7 @@ input[type=range] { width: 100%; accent-color: var(--gold); }
 .heardtext mark { background: transparent; color: var(--gold); font-weight: 700; }
 .heardtext .t { font-variant-numeric: tabular-nums; color: var(--ink); font-size: 13px; background: var(--field); border-radius: 8px; padding: 6px 8px; border: 1px solid var(--line); min-width: 52px; }
 @media (min-width: 760px) { .rv-heard { grid-column: 2; } }
+.hint.warn { color: var(--warn); }
+.storage h3.sub { font-size: 15px; margin: 16px 0 4px; }
+.storage input[type=text] { min-width: 0; }
+.saved { color: var(--green); white-space: nowrap; }

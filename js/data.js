@@ -3,7 +3,8 @@
 // in_cn_range, _norm_title, load_drops, search_drops, find_drop, build_pool, ensure_art.
 //
 // Storage:
-//   IndexedDB 'pack-shorts-data'  store 'sets'  -> { key, fetched, records }   (24 h fresh, stale fallback offline)
+//   IndexedDB 'pack-shorts-data'  store 'sets'  -> { key, fetched, records }   (30 days fresh, stale fallback offline;
+//                                 prices of the cards actually found are refreshed after each scan: refreshPrices)
 //                                 store 'kv'    -> { key, fetched, drops }     (Secret Lair drop index, 7 days)
 //                                 store 'art'   -> { key, blob }               (only if Cache Storage is unavailable)
 //   Cache Storage 'pack-shorts-art-v1'  art crops keyed by art_key, kept forever (art never changes).
@@ -17,7 +18,9 @@ const DEFAULTS = {
 };
 const CFG = { ...DEFAULTS };
 
-export const SET_MAX_AGE_MS = 24 * 3600 * 1000;      // PRICE_MAX_AGE_H
+// Card lists barely change once a set is out, and The List alone is ~30 pages, so they're kept a month.
+// Prices go stale faster: refreshPrices() updates just the found cards after a scan (1 request per 75 cards).
+export const SET_MAX_AGE_MS = 30 * 86400 * 1000;
 export const DROPS_MAX_AGE_MS = 7 * 86400 * 1000;    // DROPS_MAX_AGE_D
 export const SEARCH_MIN_GAP_MS = 600;                // Scryfall: <= 2 search pages / sec
 export const SEARCH_TRIES = 6;
@@ -78,7 +81,11 @@ function db() {
         const d = req.result;
         for (const s of ['sets', 'kv', 'art']) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'key' });
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const d = req.result;
+        d.onversionchange = () => { d.close(); _dbP = null; };     // let "clear" (deleteDatabase) go through
+        resolve(d);
+      };
       req.onerror = () => reject(req.error);
     }).catch(e => { _dbP = null; throw e; });
   }
@@ -480,6 +487,43 @@ export async function fallbackPrice(card, { signal } = {}) {
   return null;
 }
 
+
+/**
+ * Up-to-date prices for the cards found in a video (card lists are cached for a month, so their prices can be
+ * old). One POST to Scryfall's /cards/collection per 75 cards. Cards are updated in place.
+ * @param {{scryfall_id:string, usd:number|null, usd_foil:number|null}[]} cards
+ * @returns {Promise<number>} cards whose price changed
+ */
+export async function refreshPrices(cards, { signal } = {}) {
+  const ids = [...new Set((cards || []).map(c => c.scryfall_id).filter(Boolean))];
+  const fresh = new Map();
+  for (let i = 0; i < ids.length; i += 75) {
+    const body = JSON.stringify({ identifiers: ids.slice(i, i + 75).map(id => ({ id })) });
+    let r;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const wait = _lastSearch + 120 - Date.now();
+      if (wait > 0) await sleep(wait, signal);
+      try { r = await fetch(`${CFG.scryfallBase}/cards/collection`, { method: 'POST', body, signal, headers: { 'Content-Type': 'application/json', Accept: 'application/json' } }); }
+      catch (e) { if (isAbort(e)) throw e; r = null; }
+      _lastSearch = Date.now();
+      if (r && r.status !== 429 && r.status < 500) break;
+      await sleep(2000 * (attempt + 1), signal);
+    }
+    if (!r || !r.ok) continue;
+    const data = await r.json().catch(() => null);
+    for (const c of data?.data || []) fresh.set(c.id, { usd: _f(c.prices?.usd), usd_foil: _f(c.prices?.usd_foil) ?? _f(c.prices?.usd_etched) });
+  }
+  let changed = 0;
+  for (const c of cards || []) {
+    const v = fresh.get(c.scryfall_id);
+    if (!v || (v.usd == null && v.usd_foil == null)) continue;          // keep a fallback price rather than blanking it
+    if (v.usd !== c.usd || v.usd_foil !== c.usd_foil) changed++;
+    c.usd = v.usd; c.usd_foil = v.usd_foil;
+    if (c.price_from) c.price_from = '';
+  }
+  return changed;
+}
+
 // ------------------------------------------------------------------------------------------
 // Packs (booster products): exact card lists per product
 // ------------------------------------------------------------------------------------------
@@ -674,7 +718,7 @@ export function searchCards(pool, query, limit = 15) {
 const hasCaches = () => typeof caches !== 'undefined' && !!caches?.open;
 const artReq = key => new Request(ART_KEY_PREFIX + encodeURIComponent(key));
 let _artCacheP = null;
-const artCache = () => (_artCacheP ||= caches.open(ART_CACHE_NAME));
+const artCache = () => caches.open(ART_CACHE_NAME);      // not memoised: "Clear card data" deletes the cache
 
 async function cachedArtKeys() {
   const out = new Set();
@@ -706,6 +750,26 @@ async function storeArt(key, blob) {
     } catch (_) { /* fall through */ }
   }
   await idbPut('art', { key, blob });
+}
+
+/** Delete cached pictures (once their matching data is saved, they're no longer needed). */
+export async function deleteArt(keys) {
+  const list = [...(keys || [])];
+  if (!list.length) return 0;
+  let n = 0;
+  if (hasCaches()) {
+    try { const c = await artCache(); for (const k of list) if (await c.delete(artReq(k))) n++; } catch (_) { /* ignore */ }
+  }
+  try {
+    const d = await db();
+    await new Promise((resolve) => {
+      const tx = d.transaction('art', 'readwrite');
+      const st = tx.objectStore('art');
+      for (const k of list) st.delete(k);
+      tx.oncomplete = resolve; tx.onerror = resolve;
+    });
+  } catch (_) { /* ignore */ }
+  return n;
 }
 
 /** Art blob from the local cache only (no network), or null. */

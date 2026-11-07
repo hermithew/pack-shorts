@@ -48,10 +48,11 @@ The app is small, but some things are downloaded the first time you need them an
 |---|---|---|
 | The app itself, including OpenCV for card recognition | ~13 MB | first visit (cached for offline use) |
 | Speech model for "Listen for card names I say" | ~80–150 MB | first time you use voice |
-| Card list and card pictures for a set | a few MB per set | first scan of that set (list refreshed daily, pictures kept) |
+| Card list and card pictures for a set | about 20 KB of matching data per artwork | first scan of that set, or ahead of time with **Download ahead** (one picture per artwork is downloaded, turned into matching data, then deleted; lists refreshed monthly; prices of the cards found are refreshed after every scan) |
 | Secret Lair drop list | ~1 MB | first drop search (refreshed weekly) |
 | List of booster contents (~1,000 products) | ~10 MB | first pack search (refreshed weekly) |
 | Working copy of the video you're working on | same size as the video | while you work on it (only the latest one is kept) |
+| Finished Shorts | usually 20–150 MB each | kept with their job until you delete the job, re-make it, or tap **Delete saved Shorts** |
 
 After that, the app opens and works offline for sets you've already scanned. Prices refresh when you're online.
 
@@ -71,6 +72,10 @@ cache and reloads. Card-art and speech-model caches are kept.
 - When you pick a video, the app makes one private working copy of it inside its own storage on the phone. Android can
   otherwise take away access to a picked video partway through a long job. Only the latest video is kept, and you can
   delete it under **Storage on this phone**. For older jobs you'll be asked to pick the video again.
+- Each finished Short is kept in the app's storage with its job, so it's still there if you leave the app. Deleting the
+  job deletes it too.
+- The app asks the browser to protect its storage from automatic clean-up. If the browser says no, card lists and
+  pictures may be cleared when the phone runs low on space; installing the app to the home screen usually fixes that.
 - Network requests go only to Scryfall (card data and pictures), MTGJSON (Secret Lair drop names), GitHub
   (raw.githubusercontent.com, booster contents), and, if you use voice, jsDelivr and Hugging Face (speech recogniser and model).
 

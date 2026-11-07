@@ -75,7 +75,7 @@ function db() {
     dbP = new Promise((resolve, reject) => {
       const r = indexedDB.open('pack-shorts-orb', 1);
       r.onupgradeneeded = () => r.result.createObjectStore('desc', { keyPath: 'key' });
-      r.onsuccess = () => resolve(r.result);
+      r.onsuccess = () => { const d = r.result; d.onversionchange = () => { d.close(); dbP = null; }; resolve(d); };
       r.onerror = () => reject(r.error);
     }).catch(e => { dbP = null; throw e; });
   }
@@ -93,6 +93,26 @@ async function cacheGetMany(keys) {
       for (const k of keys) {
         const r = st.get(k);
         r.onsuccess = () => { if (r.result) out.set(k, r.result); };
+      }
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) { /* no cache available */ }
+  return out;
+}
+
+/** Which of these keys have saved descriptors (no data read). */
+async function cacheHasMany(keys) {
+  const out = [];
+  if (!keys.length) return out;
+  try {
+    const d = await db();
+    await new Promise((resolve, reject) => {
+      const tx = d.transaction('desc');
+      const st = tx.objectStore('desc');
+      for (const k of keys) {
+        const r = st.getKey(k);
+        r.onsuccess = () => { if (r.result !== undefined) out.push(k); };
       }
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
@@ -349,6 +369,11 @@ async function buildIndex(msg) {
     }
   }
   await cachePutMany(toSave);
+  if (msg.prepOnly) {                // "download ahead": only make and save the matching data, no index
+    index = null;
+    post({ type: 'indexed', id, ok: feats.map(f => !!f), refs: feats.filter(Boolean).length, features: 0, built, cached: fromCache, buildMs, prepOnly: true });
+    return;
+  }
 
   const ok = feats.map(f => !!f && f.n >= 20);
   let n = 0;
@@ -557,6 +582,10 @@ self.onmessage = async (ev) => {
       const r = matchFrame(img, msg.minInliers ?? 14, msg.maxCards ?? 4, passes);
       post({ type: 'result', id: msg.id, t: msg.t, found: r.found, kps: r.kps, candidates: r.candidates || 0, pass: r.pass ?? 0,
         ms: r.tm.total ?? (performance.now() - r.tm.t0), orbMs: r.tm.orb, knnMs: r.tm.knn || 0 });
+    } else if (msg.type === 'hasDesc') {
+      const pre = DESC_VERSION + '|';
+      const have = await cacheHasMany((msg.keys || []).map(k => pre + k));
+      post({ type: 'hasDesc', id: msg.id, keys: have.map(k => k.slice(pre.length)) });
     } else if (msg.type === 'clearCache') {
       const d = await db();
       await new Promise(res => { const tx = d.transaction('desc', 'readwrite'); tx.objectStore('desc').clear(); tx.oncomplete = res; tx.onerror = res; });

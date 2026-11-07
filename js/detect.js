@@ -1,7 +1,7 @@
 // Card recognition by art: drives js/detect-worker.js (OpenCV.js ORB + homography) over sampled video frames
 // and turns per-frame hits into CardEvents. Port of the original Python version: detect() / ArtMatcher grouping / build_events().
 
-import { ensureArt, getCachedArtBlob, collectorCompare } from './data.js';
+import { ensureArt, getCachedArtBlob, deleteArt, collectorCompare } from './data.js';
 
 const WORKER_URL = new URL('./detect-worker.js', import.meta.url);
 const CV_URL = new URL('../lib/opencv.js', import.meta.url).href;
@@ -73,6 +73,86 @@ export function disposeDetector() {
     s.pending.clear();
     s.worker.terminate();
   }
+}
+
+
+// ------------------------------------------------------------------------------------------
+// Pictures -> matching data (descriptors). Pictures are only needed to make the matching data, so:
+//  - artworks whose matching data is already saved download nothing;
+//  - only ONE picture per artwork is downloaded (another printing with the same art only if that one fails);
+//  - after the matching data is saved the pictures are deleted (unless keepPictures), which cuts storage ~5x.
+// ------------------------------------------------------------------------------------------
+
+async function artForRefs(s, refs, { signal, onProgress }) {
+  const all = refs.flatMap(g => g.members.map(m => m.art_key));
+  const have = new Set((await s.call({ type: 'hasDesc', keys: all })).keys);
+  let todo = refs.filter(g => !g.members.some(m => have.has(m.art_key)));
+  const res = { total: refs.length, fromData: refs.length - todo.length, fetched: 0, failed: 0 };
+  const tried = new Map();                   // group -> index of the member tried last
+  for (let round = 0; round < 3 && todo.length; round++) {
+    const pick = [];
+    for (const g of todo) {
+      const ordered = [g.rec, ...g.members.filter(m => m !== g.rec)];
+      const i = tried.has(g) ? tried.get(g) + 1 : 0;
+      if (i < ordered.length) { tried.set(g, i); pick.push([g, ordered[i]]); }
+    }
+    if (!pick.length) break;
+    let r;
+    try { r = await ensureArt(pick.map(x => x[1]), { signal, onProgress }); }
+    catch (e) {
+      if (e?.name === 'AbortError') throw e;
+      if (e?.code === 'art' && !have.size && round === 0) throw e;    // offline and nothing saved: can't match anything
+      break;
+    }
+    const bad = new Set(r.failed.map(f => f.record.art_key));
+    res.fetched += r.fetched;
+    todo = pick.filter(([, m]) => bad.has(m.art_key)).map(([g]) => g);
+  }
+  res.failed = todo.length;
+  const msgRefs = [];
+  for (const g of refs) {
+    const cands = [];
+    for (const r of [g.rec, ...g.members.filter(m => m !== g.rec)]) {
+      cands.push({ art_key: r.art_key, blob: have.has(r.art_key) ? null : await getCachedArtBlob(r) });
+    }
+    msgRefs.push({ cands });
+  }
+  return { msgRefs, res };
+}
+
+/** Delete the pictures of every artwork whose matching data is now saved (incl. same-art printings' pictures). */
+async function dropPictures(s, refs) {
+  const keys = refs.flatMap(g => g.members.map(m => m.art_key));
+  const saved = new Set((await s.call({ type: 'hasDesc', keys })).keys);
+  const drop = refs.filter(g => g.members.some(m => saved.has(m.art_key))).flatMap(g => g.members.map(m => m.art_key));
+  return deleteArt(drop);
+}
+
+/**
+ * "Download ahead": make and save the matching data for a card pool without a video (in batches, so a big set
+ * doesn't need much memory). Pictures are deleted afterwards unless keepPictures.
+ * @returns {Promise<{artworks:number, ready:number, downloaded:number, failed:number}>}
+ */
+export async function prepareCards(pool, { onProgress, signal, keepPictures = false, batch = 150 } = {}) {
+  const emit = (p) => { try { onProgress?.(p); } catch (_) { /* ignore */ } };
+  const refs = groupRefs(pool);
+  const out = { artworks: refs.length, ready: 0, downloaded: 0, failed: 0 };
+  const [s] = getWorkers(1);
+  try {
+    await s.ready;
+    for (let i = 0; i < refs.length; i += batch) {
+      if (signal?.aborted) throw abortError(signal);
+      const part = refs.slice(i, i + batch);
+      const pre = `${Math.min(i + part.length, refs.length)}/${refs.length}`;
+      const { msgRefs, res } = await artForRefs(s, part, { signal, onProgress: p => emit({ ...p, message: `Pictures ${pre}: ${p?.message || ''}` }) });
+      out.downloaded += res.fetched; out.failed += res.failed;
+      emit({ stage: 'index', fraction: i / refs.length, message: `Matching data ${pre}` });
+      const ix = await s.call({ type: 'index', refs: msgRefs, prepOnly: true });
+      out.ready += ix.refs;
+      if (!keepPictures) await dropPictures(s, part);
+    }
+    return out;
+  } finally { disposeDetector(); }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -277,7 +357,7 @@ export function makeSearchPlan(refs, { heard = [], order = null, fullEvery = 3 }
 export async function detectCards(file, pool, {
   sampleFps = 6, skipStart = 0, minInliers = 14, minHits = 2, allowDupes = false, dupeGap = 8,
   frames, duration, onProgress, onFrame, signal, lsh, workers = defaultWorkerCount(),
-  heard = [], order = null,
+  heard = [], order = null, keepPictures = false,
 } = {}) {
   if (!pool || !pool.length) throw new Error('No cards to look for – pick a set first.');
   const emit = (p) => { try { onProgress?.(p); } catch (_) { /* ignore UI errors */ } };
@@ -292,23 +372,16 @@ export async function detectCards(file, pool, {
     const pool_ = getWorkers(Math.max(1, Math.min(4, workers | 0 || 1)));
     const s = pool_[0];
 
-    // 1. art
+    // 1. pictures (only for artworks without saved matching data, one per artwork)
     let t = performance.now();
-    await ensureArt(pool, { signal, onProgress: p => emit({ ...p, stage: 'art' }) });
+    const refs = groupRefs(pool);
+    const { msgRefs, res: artRes } = await artForRefs(s, refs, { signal, onProgress: p => emit({ ...p, stage: 'art' }) });
     stats.artMs = performance.now() - t;
+    stats.art = artRes;
     check();
 
     // 2. reference index (descriptors cached in IndexedDB by the worker)
     t = performance.now();
-    const refs = groupRefs(pool);
-    const msgRefs = [];
-    for (const g of refs) {
-      const cands = [];
-      for (const r of [g.rec, ...g.members.filter(m => m !== g.rec)]) {
-        cands.push({ art_key: r.art_key, blob: await getCachedArtBlob(r) });
-      }
-      msgRefs.push({ cands });
-    }
     const sig = refs.map(g => g.members.map(m => m.art_key).join('+')).join(',');
     emit({ stage: 'index', fraction: 0, message: 'Loading the recogniser…' });
     stats.cvLoadMs = (await s.ready).ms;
@@ -322,6 +395,8 @@ export async function detectCards(file, pool, {
     Object.assign(stats, { refs: ix.refs, features: ix.features, built: ix.built, cachedDesc: ix.cached,
       msPerBuilt: ix.msPerBuilt || 0, lshMs: ix.lshMs || 0, lsh: ix.lsh, workers: pool_.length });
     stats.indexMs = performance.now() - t;
+    msgRefs.length = 0;                                      // let the pictures be garbage-collected
+    if (!keepPictures) stats.picturesDeleted = await dropPictures(s, refs).catch(() => 0);
     if (!ix.refs) throw new Error('No card art could be loaded – nothing to match against.');
     check();
 

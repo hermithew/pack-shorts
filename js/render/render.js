@@ -5,6 +5,7 @@
 import { openMp4 } from '../media/demux.js';
 import { decodeVideo, drawUpright } from '../media/frames.js';
 import { canConvert, frameToImageData } from '../media/yuv.js';
+import { GLFramePainter, GLPlanePainter, canUploadPlanes, hasWebGL2 } from '../media/glframe.js';
 import { decodeAudioPCM } from '../media/audio.js';
 import { buildTimeline, drawOverlays, OUT_W, OUT_H } from './painter.js';
 import { synthSfx } from './sfx.js';
@@ -16,8 +17,15 @@ export const AUDIO_BITRATE = 192_000;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const abortErr = signal => signal?.reason ?? new DOMException('Aborted', 'AbortError');
 
-/** Output frame rate: source fps rounded, clamped to 24..60 (like the PC version). */
-export const outputFps = srcFps => Math.min(60, Math.max(24, Math.round(srcFps || 30)));
+/**
+ * Output frame rate. Default: the source rate capped at 30 (phones mostly record 60 fps; Shorts don't need it and
+ * it halves the encode work). `requested` (settings.fps) raises/lowers the cap, max 60. Never above the source
+ * rate (no duplicated frames), never below 24. Frames are picked by timestamp, so 60 -> 30 takes every 2nd frame.
+ */
+export const outputFps = (srcFps, requested) => {
+  const cap = Number.isFinite(+requested) && +requested > 0 ? Math.min(60, Math.max(24, Math.round(+requested))) : 30;
+  return Math.min(cap, Math.max(24, Math.round(srcFps || 30)));
+};
 
 function videoCandidates(fps) {
   const lvl = fps > 30 ? '2A' : '28';
@@ -218,7 +226,7 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
   const info = await openMp4(file);
   const v = info.video;
   if (!v) throw new Error('This file has no video track');
-  const fps = outputFps(v.fps);
+  const fps = outputFps(v.fps, settings.fps);
   const duration = v.duration || info.duration;
   const N = Math.max(1, Math.round(duration * fps));
   const outDur = N / fps;
@@ -307,18 +315,85 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
   const fit = settings.fit === 'crop' ? 'crop' : 'pad';
   const keyEvery = Math.round(fps * 2);
   const frameDur = Math.round(1e6 / fps);
-  let frames = 0, lastReport = 0;
+  let frames = 0, lastReport = 0, chain = Promise.resolve(), pend = 0;
   const tv0 = performance.now();
-  // Frames are copied straight out of the decoder and converted in JS (media/yuv.js), then put on the canvas.
-  // Drawing VideoFrames with drawImage kept ~5 MB per frame in browser caches and crashed phones.
+  // Frame paths (settings.renderPath forces one: 'gl' | 'js' | 'canvas'; default 'auto'):
+  //  'gl'     frame.copyTo() -> Y/U/V planes as WebGL2 textures -> YUV->RGB, rotation, scaling on the GPU -> GL canvas
+  //           drawn onto the 2D overlay canvas. (Opaque GPU frames that can't be copied are imported with
+  //           texSubImage2D(VideoFrame).) Renderer memory stays ~flat; speed depends on the GPU.
+  //  'js'     frame.copyTo() + YUV->RGBA in JS (media/yuv.js) + putImageData.
+  //  'canvas' drawImage(VideoFrame) — last resort: on Chromium it kept ~5 MB per frame in caches and crashed phones.
+  //  'auto'   if WebGL2 works, render a few frames each way and keep the faster (a software/slow GPU loses to JS).
+  const want = ['gl', 'js', 'canvas'].includes(settings.renderPath) ? settings.renderPath : 'auto';
+  let mode = (want === 'auto' || want === 'gl') && hasWebGL2() ? 'gl' : want === 'canvas' ? 'canvas' : 'js';
+  let glp = null, glf = null, glFrames = 0, jsFrames = 0, cvFrames = 0, copyOK = null;
+  const fallbacks = [];
+  let trial = null, choice = null;
+  const dropGL = (e) => {
+    fallbacks.push('WebGL path off: ' + (e?.message || e));
+    console.warn('render: WebGL frame path failed, using the JS converter', e);
+    try { glp?.dispose(); glf?.dispose(); } catch (_) {}
+    glp = glf = null; trial = null; mode = 'js';
+  };
+  if (mode === 'gl') { try { glp = new GLPlanePainter(OUT_W, OUT_H); } catch (e) { dropGL(e); } }
+  // speed trial for 'auto': WARM frames to settle, then TRIAL frames timed on each path
+  const WARM = 6, TRIAL = Math.max(20, Math.round(fps));
+  if (want === 'auto' && mode === 'gl' && N > 2 * (WARM + TRIAL) + fps * 2) trial = { phase: 'gl', n: 0, t0: 0, res: {} };
   const img = new ImageData(OUT_W, OUT_H);
-  let copyOK = null, chain = Promise.resolve(), pend = 0;
-  const paint = async (f) => {
+  const paintJS = async (f) => {
     if (copyOK !== false && canConvert(f)) {
-      try { await frameToImageData(f, img, info.rotation, fit); ctx.putImageData(img, 0, 0); copyOK = true; return; }
-      catch (e) { if (copyOK) throw e; copyOK = false; console.warn('direct frame copy unavailable, using canvas', e); }
+      try { await frameToImageData(f, img, info.rotation, fit); ctx.putImageData(img, 0, 0); copyOK = true; jsFrames++; return; }
+      catch (e) {
+        if (copyOK) throw e;
+        copyOK = false; fallbacks.push('JS converter off: ' + (e?.message || e));
+        console.warn('direct frame copy unavailable, using canvas', e);
+      }
     }
-    drawUpright(ctx, f, info.rotation, OUT_W, OUT_H, fit);
+    drawUpright(ctx, f, info.rotation, OUT_W, OUT_H, fit); cvFrames++;
+  };
+  const paint = async (f) => {
+    if (mode === 'gl') {
+      try {
+        let glc;
+        if (canUploadPlanes(f)) glc = await glp.drawAsync(f, info.rotation, fit);
+        else if (!f.format) glc = (glf ||= new GLFramePainter(OUT_W, OUT_H)).draw(f, info.rotation, fit);
+        if (glc) { ctx.drawImage(glc, 0, 0); glFrames++; return; }
+      } catch (e) { if (mode === 'gl') dropGL(e); }
+    }
+    if (mode === 'canvas') { drawUpright(ctx, f, info.rotation, OUT_W, OUT_H, fit); cvFrames++; return; }
+    await paintJS(f);
+  };
+  const tick = () => {
+    if (!trial) return;
+    const now = performance.now();
+    trial.n++;
+    if (trial.n === WARM) trial.t0 = now;
+    else if (trial.n === WARM + TRIAL) {
+      trial.res[trial.phase] = TRIAL / ((now - trial.t0) / 1000);
+      if (trial.phase === 'gl') { trial.phase = 'js'; trial.n = 0; mode = 'js'; }
+      else {
+        // prefer the GPU unless the JS converter is clearly faster (GPU path also leaves the CPU for decode/encode)
+        mode = trial.res.gl >= 0.9 * trial.res.js ? 'gl' : 'js';
+        choice = { gl: +trial.res.gl.toFixed(1), js: +trial.res.js.toFixed(1), chose: mode };
+        if (mode === 'js') { try { glp?.dispose(); glf?.dispose(); } catch (_) {} glp = glf = null; }
+        trial = null;
+      }
+    }
+  };
+  const finishFrame = (t, k) => {
+    drawOverlays(ctx, t, tl);
+    const vf = new VideoFrame(canvas, { timestamp: k * frameDur, duration: frameDur });
+    venc.encode(vf, { keyFrame: k % keyEvery === 0 });
+    vf.close();
+    frames++;
+    tick();
+    feedAudio((k + 1) / fps + 0.5);
+    const now = performance.now();
+    if (now - lastReport > 250) {
+      lastReport = now;
+      const rate = frames / ((now - tv0) / 1000);
+      report('video', 0.1 + 0.87 * (k + 1) / N, `Rendering ${t.toFixed(1)} s / ${outDur.toFixed(1)} s (${rate.toFixed(1)} fps)`);
+    }
   };
   try {
     report('video', 0.1, 'Rendering…');
@@ -330,8 +405,12 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
       },
       onFrame: (frame0, t, k) => {
         if (error) throw error;
+        // clone so the decoder's frame can be released at once; ours is closed right after it's painted
         const f = frame0.clone(); pend++;
-        chain = chain.then(() => drawAndEncode(f, t, k)).catch(e => { error = error || e; }).finally(() => { f.close(); pend--; });
+        chain = chain.then(async () => {
+          try { if (error) throw error; await paint(f); } finally { f.close(); }
+          finishFrame(t, k);
+        }).catch(e => { error = error || e; }).finally(() => { pend--; });
       },
     });
     await chain;
@@ -344,28 +423,15 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
     muxer.finalize();
   } finally {
     for (const e of [venc, aenc]) if (e && e.state !== 'closed') try { e.close(); } catch (_) {}
+    try { glp?.dispose(); glf?.dispose(); } catch (_) {}
     mix = null;
   }
-  async function drawAndEncode(frame, t, k) {
-        if (error) throw error;
-        await paint(frame);
-        drawOverlays(ctx, t, tl);
-        const vf = new VideoFrame(canvas, { timestamp: k * frameDur, duration: frameDur });
-        venc.encode(vf, { keyFrame: k % keyEvery === 0 });
-        vf.close();
-        frames++;
-        feedAudio((k + 1) / fps + 0.5);
-        const now = performance.now();
-        if (now - lastReport > 250) {
-          lastReport = now;
-          const rate = frames / ((now - tv0) / 1000);
-          report('video', 0.1 + 0.87 * (k + 1) / N, `Rendering ${(t).toFixed(1)} s / ${outDur.toFixed(1)} s (${rate.toFixed(1)} fps)`);
-        }
-  }
+  const used = [['gl', glFrames], ['js', jsFrames], ['canvas', cvFrames]].filter(x => x[1]).map(x => x[0]);
+  const path = used.join('+') || 'none';
   const mimeType = container === 'mp4' ? 'video/mp4' : 'video/webm';
   const blob = sink.toBlob(mimeType);
   const secs = (performance.now() - t0) / 1000;
-  const stats = { frames, fps, seconds: secs, renderFps: frames / ((performance.now() - tv0) / 1000), warnings,
+  const stats = { frames, fps, path, pathFrames: { gl: glFrames, js: jsFrames, canvas: cvFrames }, pathTrial: choice, fallbacks, seconds: secs, renderFps: frames / ((performance.now() - tv0) / 1000), warnings,
     videoCodec: codecs.video, audioCodec: aMux ? codecs.audio : null, size: blob.size };
   report('done', 1, `Done in ${secs.toFixed(1)} s`);
   return { blob, mimeType, extension: container, codec: codecs.video + (aMux ? ',' + codecs.audio : ''), stats };

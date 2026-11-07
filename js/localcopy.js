@@ -134,7 +134,7 @@ onmessage = async (e) => {
   } catch (err) { try { h && h.close(); } catch {} postMessage({ ok: false, id: m.id, error: String(err && err.message || err) }); }
 };`;
 
-function workerWriter(name) {
+function workerWriter(name, dirName = DIR) {
   const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
   const w = new Worker(url);
   URL.revokeObjectURL(url);
@@ -146,7 +146,7 @@ function workerWriter(name) {
     w.postMessage({ ...msg, id: my }, transfer || []);
   });
   return {
-    open: () => call({ op: 'open', dir: DIR, name }),
+    open: () => call({ op: 'open', dir: dirName, name }),
     write: (buf, at) => call({ op: 'write', buf, at }, [buf]),
     close: async () => { try { await call({ op: 'close' }); } finally { w.terminate(); } },
     abort: () => w.terminate(),
@@ -217,4 +217,79 @@ async function copyWith(method, file, dir, name, onProgress, signal) {
     try { if (writer) await writer.abort(); } catch { /* ignore */ }
     try { ww?.abort(); } catch { /* ignore */ }
   }
+}
+
+// ---------------------------------------------------------------- finished Shorts
+// Each finished video is kept in private storage with its job, so leaving the app (or the phone closing it)
+// doesn't lose it. It's removed when the job is deleted, re-made, or from the Storage panel.
+const OUT_DIR = 'shorts';
+async function outDir() {
+  if (!navigator.storage?.getDirectory) return null;
+  return (await navigator.storage.getDirectory()).getDirectoryHandle(OUT_DIR, { create: true });
+}
+const outName = (jobId) => String(jobId).replace(/[^\w-]/g, '_');
+
+/** Keep a finished Short for this job. Returns true when it was stored. */
+export async function saveOutput(jobId, blob) {
+  let dir = null;
+  try {
+    dir = await outDir();
+    if (!dir) return false;
+    try { await navigator.storage.persist?.(); } catch { /* ignore */ }
+    const fh = await dir.getFileHandle(outName(jobId), { create: true });
+    if (typeof fh.createWritable === 'function') {
+      const w = await fh.createWritable({ keepExistingData: false });
+      try { await w.write(blob); await w.close(); } catch (e) { try { await w.abort(); } catch { /* ignore */ } throw e; }
+    } else {                                              // Safari: write from a worker
+      const ww = workerWriter(outName(jobId), OUT_DIR);
+      try {
+        await ww.open();
+        for (let at = 0; at < blob.size; at += CHUNK) await ww.write(await blob.slice(at, at + CHUNK).arrayBuffer(), at);
+        await ww.close();
+      } catch (e) { ww.abort(); throw e; }
+    }
+    const f = await fh.getFile();
+    if (f.size !== blob.size) throw new Error('incomplete');
+    return true;
+  } catch (e) {
+    console.warn('could not keep the finished video', e);
+    if (dir) await dir.removeEntry(outName(jobId)).catch(() => {});
+    return false;
+  }
+}
+
+/** The kept Short for a job (a Blob of the given type), or null. */
+export async function getOutput(jobId, size, type = 'video/mp4') {
+  try {
+    const dir = await outDir();
+    if (!dir) return null;
+    const f = await (await dir.getFileHandle(outName(jobId))).getFile();
+    if (size != null && f.size !== size) return null;
+    return new Blob([f], { type });
+  } catch { return null; }
+}
+
+/** Delete kept Shorts: one job's, or every one not in `keepIds` (when jobId is null). */
+export async function deleteOutputs({ jobId = null, keepIds = null } = {}) {
+  try {
+    const dir = await outDir();
+    if (!dir) return;
+    const keep = keepIds ? new Set([...keepIds].map(outName)) : null;
+    const names = [];
+    for await (const [n] of dir.entries()) {
+      if (jobId != null ? n === outName(jobId) : !(keep && keep.has(n))) names.push(n);
+    }
+    for (const n of names) await dir.removeEntry(n).catch(() => {});
+  } catch { /* ignore */ }
+}
+
+/** Bytes used by kept Shorts. */
+export async function outputsUsage() {
+  let total = 0, count = 0;
+  try {
+    const dir = await outDir();
+    if (!dir) return { total, count };
+    for await (const [, h] of dir.entries()) if (h.kind === 'file') { total += (await h.getFile()).size; count++; }
+  } catch { /* ignore */ }
+  return { total, count };
 }
