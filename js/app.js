@@ -515,12 +515,19 @@ function setVideo(f) {
   show(v, !!f); show('novideo', !f);
 }
 
+let saveWarned = 0;
 async function saveJob() {
   if (!job) return;
   // Save a snapshot but keep the SAME in-memory job: the card rows' buttons hold references to its card objects,
   // so replacing it with the stored copy made every edit after the first save land on a stale object.
-  const saved = await store.putJob(job);
-  if (saved && job && saved.id === job.id) job.updated = saved.updated;
+  try {
+    const saved = await store.putJob(job);
+    if (saved && job && saved.id === job.id) job.updated = saved.updated;
+  } catch (e) {
+    // storage hiccups must never stop a scan or throw away a finished video
+    console.warn('could not save the job', e);
+    if (Date.now() - saveWarned > 60000) { saveWarned = Date.now(); toast('Couldn’t save to this phone’s storage just now — keep the app open.'); }
+  }
 }
 
 function drawJob() {
@@ -1057,7 +1064,7 @@ async function runRender() {
     job.status = 'done';
     job.output = { extension: r.extension, mimeType: r.mimeType, size: r.blob.size, at: Date.now(), codec: r.codec || '', kept };
     editing = false;
-    await saveJob();
+    try { await saveJob(); } catch (e) { console.warn('could not save the job', e); }   // never lose a finished video over this
     showResult();
   } catch (e) {
     console.error('render failed', e);
@@ -1066,7 +1073,7 @@ async function runRender() {
       job.error = friendlyError(e, 'render');
       job.errorHTML = errorHTML(e, 'render');
     }
-    await saveJob();
+    await saveJob().catch((e2) => console.warn('could not save the job', e2));
   } finally {
     endBusy();
     document.title = 'Pack Shorts';

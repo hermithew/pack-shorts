@@ -27,7 +27,15 @@ function open() {
         if (!db.objectStoreNames.contains('jobs')) db.createObjectStore('jobs', { keyPath: 'id' }).createIndex('updated', 'updated');
         if (!db.objectStoreNames.contains('prefs')) db.createObjectStore('prefs');
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        const db = req.result;
+        // The browser can close the connection on its own (low storage, data cleared, a long time in the
+        // background). Forget it so the next call opens a fresh one instead of failing.
+        db.onclose = () => { if (dbp && dbp._db === db) dbp = null; };
+        db.onversionchange = () => { db.close(); if (dbp && dbp._db === db) dbp = null; };
+        dbp._db = db;
+        resolve(db);
+      };
       req.onerror = () => { useMem = true; resolve(null); };
       req.onblocked = () => { useMem = true; resolve(null); };
     });
@@ -35,7 +43,19 @@ function open() {
   return dbp;
 }
 
-function tx(db, store, mode, fn) {
+/** One transaction; if the connection was closed under us, reopen once and retry. */
+async function tx(db, store, mode, fn) {
+  try { return await tx1(db, store, mode, fn); }
+  catch (e) {
+    if (e?.name !== 'InvalidStateError' && e?.name !== 'UnknownError') throw e;
+    if (dbp && (await dbp) === db) dbp = null;
+    const fresh = await open();
+    if (!fresh || fresh === db) throw e;
+    return tx1(fresh, store, mode, fn);
+  }
+}
+
+function tx1(db, store, mode, fn) {
   return new Promise((resolve, reject) => {
     const t = db.transaction(store, mode);
     const s = t.objectStore(store);
