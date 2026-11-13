@@ -1261,7 +1261,59 @@ async function drawStorage() {
     const ok = await store.healthy();
     show('st-broken', !ok);
     show('st-brave', !!navigator.brave);
+    drawStorageDetails();
   } catch (e) { el.textContent = 'Storage details aren’t available in this browser.'; }
+}
+
+/** What's actually stored, and since when: makes it easy to tell if (and when) the browser wiped the app's data. */
+async function idbCount(name, storeName) {
+  try {
+    if (indexedDB.databases && !(await indexedDB.databases()).some((d) => d.name === name)) return 0;
+    return await new Promise((res) => {
+      const r = indexedDB.open(name);
+      r.onupgradeneeded = () => { r.transaction.abort(); res(0); };
+      r.onerror = () => res(0);
+      r.onsuccess = () => {
+        const d = r.result;
+        try {
+          if (!d.objectStoreNames.contains(storeName)) { d.close(); return res(0); }
+          const q = d.transaction(storeName).objectStore(storeName).count();
+          q.onsuccess = () => { d.close(); res(q.result); };
+          q.onerror = () => { d.close(); res(0); };
+        } catch (e) { d.close(); res(0); }
+      };
+    });
+  } catch (e) { return 0; }
+}
+async function drawStorageDetails() {
+  const el = $('st-details');
+  if (!el) return;
+  try {
+    const [jobs, lists, learned, since, ver] = await Promise.all([
+      store.listJobs().then((j) => j.length).catch(() => '?'),
+      idbCount('pack-shorts-data', 'sets'),
+      idbCount('pack-shorts-orb', 'desc'),
+      store.getPref('dataSince'),
+      swVersion(),
+    ]);
+    let pics = 0;
+    try { for (const n of await caches.keys()) if (n.startsWith(ART_CACHE_PREFIX)) pics += (await (await caches.open(n)).keys()).length; } catch (e) { /* ignore */ }
+    const when = since ? new Date(since).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '?';
+    el.textContent = `Saved here since ${when} · ${jobs} job${jobs === 1 ? '' : 's'} · ${lists} card list${lists === 1 ? '' : 's'} · ${learned.toLocaleString()} artworks learned · ${pics.toLocaleString()} pictures · app ${ver || '?'}`;
+  } catch (e) { el.textContent = ''; }
+}
+async function swVersion() {
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    const w = reg?.active;
+    if (!w) return '';
+    return await new Promise((res) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = (e) => res(e.data);
+      w.postMessage({ type: 'VERSION' }, [ch.port2]);
+      setTimeout(() => res(''), 1500);
+    });
+  } catch (e) { return ''; }
 }
 
 /**
@@ -1363,6 +1415,7 @@ async function main() {
   // being cleared when the phone runs low on space. Ask again on each start until it's granted.
   navigator.storage?.persisted?.().then((ok) => { if (!ok) store.persist().then(() => drawStorage()); }).catch(() => {});
   bindStorage();
+  store.getPref('dataSince').then((v) => { if (!v) store.setPref('dataSince', Date.now()); }).catch(() => {});
   store.healthy().then((ok) => { if (!ok) toast('This phone’s browser isn’t letting the app save anything right now (phone nearly full?). See Storage on this phone.', 8000); });
 
   const [sets, voice, layout, plat, tiers, outro, sfx, persistAsked, pack] = await Promise.all(
