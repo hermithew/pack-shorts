@@ -74,6 +74,9 @@ cache and reloads. Card-art and speech-model caches are kept.
   delete it under **Storage on this phone**. For older jobs you'll be asked to pick the video again.
 - Each finished Short is kept in the app's storage with its job, so it's still there if you leave the app. Deleting the
   job deletes it too.
+- **Brave users:** Brave's *Auto Shred* ("forget me when I close this site") and *Clear data on exit* erase all of the
+  app's data when it's closed. Turn them off for the app's site (Settings → Brave Shields & privacy, and the site's
+  Shields panel), or use Chrome.
 - The app asks the browser to protect its storage from automatic clean-up. If the browser says no, card lists and
   pictures may be cleared when the phone runs low on space; installing the app to the home screen usually fixes that.
 - Network requests go only to Scryfall (card data and pictures), MTGJSON (Secret Lair drop names), GitHub

@@ -1260,6 +1260,7 @@ async function drawStorage() {
     show('st-protect', !!navigator.storage?.persisted && !persisted);
     const ok = await store.healthy();
     show('st-broken', !ok);
+    show('st-brave', !!navigator.brave);
   } catch (e) { el.textContent = 'Storage details aren’t available in this browser.'; }
 }
 
