@@ -431,7 +431,7 @@ export async function renderShortHere(file, events, settings = {}, { onProgress,
   const mimeType = container === 'mp4' ? 'video/mp4' : 'video/webm';
   const blob = sink.toBlob(mimeType);
   const secs = (performance.now() - t0) / 1000;
-  const stats = { frames, fps, path, pathFrames: { gl: glFrames, js: jsFrames, canvas: cvFrames }, pathTrial: choice, fallbacks, seconds: secs, renderFps: frames / ((performance.now() - tv0) / 1000), warnings,
+  const stats = { source: `${v.codedWidth}x${v.codedHeight} ${Math.round(v.fps || 0)}fps ${v.codec || ''}`, frames, fps, path, pathFrames: { gl: glFrames, js: jsFrames, canvas: cvFrames }, pathTrial: choice, fallbacks, seconds: secs, renderFps: frames / ((performance.now() - tv0) / 1000), warnings,
     videoCodec: codecs.video, audioCodec: aMux ? codecs.audio : null, size: blob.size };
   report('done', 1, `Done in ${secs.toFixed(1)} s`);
   return { blob, mimeType, extension: container, codec: codecs.video + (aMux ? ',' + codecs.audio : ''), stats };

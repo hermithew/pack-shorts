@@ -1046,6 +1046,7 @@ async function runRender() {
     job.settings = { ...DEFAULT_SETTINGS, ...job.settings, ...o, layout };
     await saveJob();
     prog.stage('render', `${cap.video || ''}${cap.audio ? ' + ' + cap.audio : ''}`);
+    const t0render = Date.now();
     const r = await render.renderShort(file, events, job.settings, {
       signal,
       onProgress: (p) => {
@@ -1063,7 +1064,9 @@ async function runRender() {
     const kept = await lc.saveOutput(job.id, r.blob);
     unsaved = !kept;
     job.status = 'done';
-    job.output = { extension: r.extension, mimeType: r.mimeType, size: r.blob.size, at: Date.now(), codec: r.codec || '', kept };
+    job.output = { extension: r.extension, mimeType: r.mimeType, size: r.blob.size, at: Date.now(), codec: r.codec || '', kept,
+      took: Math.round((Date.now() - t0render) / 1000),
+      how: r.stats ? `${r.stats.path || '?'} · ${(r.stats.renderFps || 0).toFixed(1)} fps · from ${r.stats.source || '?'}${r.stats.pathTrial ? ` · tested GPU ${r.stats.pathTrial.gl} / JS ${r.stats.pathTrial.js} fps` : ''}` : '' };
     editing = false;
     try { await saveJob(); } catch (e) { console.warn('could not save the job', e); }   // never lose a finished video over this
     showResult();
@@ -1092,7 +1095,9 @@ function showResult() {
   const a = $('dl');
   a.href = outURL;
   a.download = outName();
-  $('outinfo').textContent = `${outName()} · ${mb(result.blob.size)}${result.codec ? ' · ' + result.codec : ''}`;
+  const o = job?.output || {};
+  $('outinfo').textContent = `${outName()} · ${mb(result.blob.size)}${result.codec ? ' · ' + result.codec : ''}`
+    + (o.took ? ` · made in ${Math.floor(o.took / 60)}m ${o.took % 60}s` : '') + (o.how ? ` (${o.how})` : '');
   $('outkept').textContent = job?.output?.kept
     ? 'This video is kept in the app with this job until you delete the job or re-make it.'
     : 'The app couldn’t keep a copy of this video (not enough space?) — download or share it before you leave.';
