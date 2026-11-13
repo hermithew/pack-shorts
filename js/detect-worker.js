@@ -70,12 +70,24 @@ function loadCv(url) {
 // ------------------------------------------------------------------------------------------
 
 let dbP = null;
+const closedErr = (e) => e && (e.name === 'InvalidStateError' || e.name === 'UnknownError');
+/** Run fn(connection); if the browser closed the connection under us, open a fresh one and try once more. */
+async function withDb(fn) {
+  const d = await db();
+  try { return await fn(d); }
+  catch (e) {
+    if (!closedErr(e)) throw e;
+    if (dbP && (await dbP.catch(() => null)) === d) dbP = null;
+    return fn(await db());
+  }
+}
+
 function db() {
   if (!dbP) {
     dbP = new Promise((resolve, reject) => {
       const r = indexedDB.open('pack-shorts-orb', 1);
       r.onupgradeneeded = () => r.result.createObjectStore('desc', { keyPath: 'key' });
-      r.onsuccess = () => { const d = r.result; d.onversionchange = () => { d.close(); dbP = null; }; resolve(d); };
+      r.onsuccess = () => { const d = r.result; d.onversionchange = () => { d.close(); dbP = null; }; d.onclose = () => { dbP = null; }; resolve(d); };
       r.onerror = () => reject(r.error);
     }).catch(e => { dbP = null; throw e; });
   }
@@ -86,8 +98,7 @@ async function cacheGetMany(keys) {
   const out = new Map();
   if (!keys.length) return out;
   try {
-    const d = await db();
-    await new Promise((resolve, reject) => {
+    await withDb((d) => new Promise((resolve, reject) => {
       const tx = d.transaction('desc');
       const st = tx.objectStore('desc');
       for (const k of keys) {
@@ -96,7 +107,7 @@ async function cacheGetMany(keys) {
       }
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
-    });
+    }));
   } catch (e) { /* no cache available */ }
   return out;
 }
@@ -106,8 +117,7 @@ async function cacheHasMany(keys) {
   const out = [];
   if (!keys.length) return out;
   try {
-    const d = await db();
-    await new Promise((resolve, reject) => {
+    await withDb((d) => new Promise((resolve, reject) => {
       const tx = d.transaction('desc');
       const st = tx.objectStore('desc');
       for (const k of keys) {
@@ -116,7 +126,7 @@ async function cacheHasMany(keys) {
       }
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
-    });
+    }));
   } catch (e) { /* no cache available */ }
   return out;
 }
@@ -124,14 +134,13 @@ async function cacheHasMany(keys) {
 async function cachePutMany(rows) {
   if (!rows.length) return;
   try {
-    const d = await db();
-    await new Promise((resolve, reject) => {
+    await withDb((d) => new Promise((resolve, reject) => {
       const tx = d.transaction('desc', 'readwrite');
       const st = tx.objectStore('desc');
       for (const row of rows) st.put(row);
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
-    });
+    }));
   } catch (e) { /* cache is an optimisation only */ }
 }
 
@@ -357,6 +366,8 @@ async function buildIndex(msg) {
         buildMs += performance.now() - t0;
         built++;
         toSave.push(f);
+        // save as we go: if the phone kills the page part-way, the work done so far isn't lost
+        if (toSave.length >= 100) await cachePutMany(toSave.splice(0));
       }
       feats[i] = f;   // Python: only a failed image load moves on to an alternate
       break;

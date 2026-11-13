@@ -72,6 +72,18 @@ function emit(onProgress, p) {
 
 // --- IndexedDB (tiny promise wrapper) ---
 let _dbP = null;
+const closedErr = (e) => e && (e.name === 'InvalidStateError' || e.name === 'UnknownError');
+/** Run fn(connection); if the browser closed the connection under us, open a fresh one and try once more. */
+async function withDb(fn) {
+  const d = await db();
+  try { return await fn(d); }
+  catch (e) {
+    if (!closedErr(e)) throw e;
+    if (_dbP && (await _dbP.catch(() => null)) === d) _dbP = null;
+    return fn(await db());
+  }
+}
+
 function db() {
   if (!_dbP) {
     _dbP = new Promise((resolve, reject) => {
@@ -84,6 +96,7 @@ function db() {
       req.onsuccess = () => {
         const d = req.result;
         d.onversionchange = () => { d.close(); _dbP = null; };     // let "clear" (deleteDatabase) go through
+        d.onclose = () => { _dbP = null; };                         // closed by the browser: reopen next time
         resolve(d);
       };
       req.onerror = () => reject(req.error);
@@ -94,24 +107,22 @@ function db() {
 
 async function idbGet(store, key) {
   try {
-    const d = await db();
-    return await new Promise((resolve, reject) => {
+    return await withDb((d) => new Promise((resolve, reject) => {
       const r = d.transaction(store).objectStore(store).get(key);
       r.onsuccess = () => resolve(r.result || null);
       r.onerror = () => reject(r.error);
-    });
+    }));
   } catch (_) { return null; }
 }
 
 async function idbPut(store, value) {
   try {
-    const d = await db();
-    await new Promise((resolve, reject) => {
+    await withDb((d) => new Promise((resolve, reject) => {
       const tx = d.transaction(store, 'readwrite');
       tx.objectStore(store).put(value);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
-    });
+    }));
   } catch (e) { console.warn('[data] could not save to IndexedDB:', e); }
 }
 
@@ -730,12 +741,11 @@ async function cachedArtKeys() {
     } catch (_) { /* fall through to IDB */ }
   }
   try {
-    const d = await db();
-    const keys = await new Promise((resolve, reject) => {
+    const keys = await withDb((d) => new Promise((resolve, reject) => {
       const r = d.transaction('art').objectStore('art').getAllKeys();
       r.onsuccess = () => resolve(r.result);
       r.onerror = () => reject(r.error);
-    });
+    }));
     for (const k of keys) out.add(k);
   } catch (_) { /* nothing cached */ }
   return out;
@@ -761,13 +771,12 @@ export async function deleteArt(keys) {
     try { const c = await artCache(); for (const k of list) if (await c.delete(artReq(k))) n++; } catch (_) { /* ignore */ }
   }
   try {
-    const d = await db();
-    await new Promise((resolve) => {
+    await withDb((d) => new Promise((resolve) => {
       const tx = d.transaction('art', 'readwrite');
       const st = tx.objectStore('art');
       for (const k of list) st.delete(k);
       tx.oncomplete = resolve; tx.onerror = resolve;
-    });
+    }));
   } catch (_) { /* ignore */ }
   return n;
 }

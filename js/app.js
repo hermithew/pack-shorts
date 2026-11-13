@@ -11,6 +11,8 @@ import * as store from './store.js';
 import * as lc from './localcopy.js';
 import { LayoutEditor, PLATFORMS, platformOverlay } from './layout.js';
 
+store.setOnTrim((id) => lc.deleteOutputs({ jobId: id }));     // a job trimmed away takes its saved Short with it
+
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const MOCK = params.get('mock') === '1';
@@ -326,7 +328,6 @@ const STATUS_LABEL = { new: 'new', scanning: 'interrupted', rendering: 'interrup
 
 async function drawJobs() {
   const jobs = await store.listJobs();
-  lc.deleteOutputs({ keepIds: jobs.map((j) => j.id) });      // saved Shorts of jobs that were trimmed away
   show('s-jobs', jobs.length > 0);
   const box = $('jobs');
   box.innerHTML = '';
@@ -1257,6 +1258,8 @@ async function drawStorage() {
       + (vc.count ? ` Includes a ${(vc.total / 1048576).toFixed(0)} MB working copy of your latest video.` : '')
       + (oc.count ? ` ${oc.count} finished Short${oc.count === 1 ? '' : 's'}: ${(oc.total / 1048576).toFixed(0)} MB.` : '');
     show('st-protect', !!navigator.storage?.persisted && !persisted);
+    const ok = await store.healthy();
+    show('st-broken', !ok);
   } catch (e) { el.textContent = 'Storage details aren’t available in this browser.'; }
 }
 
@@ -1359,6 +1362,7 @@ async function main() {
   // being cleared when the phone runs low on space. Ask again on each start until it's granted.
   navigator.storage?.persisted?.().then((ok) => { if (!ok) store.persist().then(() => drawStorage()); }).catch(() => {});
   bindStorage();
+  store.healthy().then((ok) => { if (!ok) toast('This phone’s browser isn’t letting the app save anything right now (phone nearly full?). See Storage on this phone.', 8000); });
 
   const [sets, voice, layout, plat, tiers, outro, sfx, persistAsked, pack] = await Promise.all(
     ['sets', 'voice', 'layout', 'platform', 'tiers', 'outro', 'sfx', 'persistAsked', 'pack'].map((k) => store.getPref(k)));

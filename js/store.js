@@ -15,6 +15,9 @@ const MAX_JOBS = 30;
 let dbp = null;
 const mem = { jobs: new Map(), prefs: new Map() };
 let useMem = false;
+let onTrim = null;
+/** Called with the id of each old job removed to stay under the job limit. */
+export function setOnTrim(fn) { onTrim = fn; }
 
 function open() {
   if (useMem) return Promise.resolve(null);
@@ -37,7 +40,6 @@ function open() {
         resolve(db);
       };
       req.onerror = () => { useMem = true; resolve(null); };
-      req.onblocked = () => { useMem = true; resolve(null); };
     });
   }
   return dbp;
@@ -97,7 +99,7 @@ export async function putJob(job) {
   if (!db) { mem.jobs.set(rec.id, rec); return clone(rec); }
   await tx(db, 'jobs', 'readwrite', (s) => s.put(rec));
   const all = await listJobs();
-  for (const old of all.slice(MAX_JOBS)) await deleteJob(old.id);
+  for (const old of all.slice(MAX_JOBS)) { await deleteJob(old.id); try { onTrim?.(old.id); } catch (_) { /* ignore */ } }
   return clone(rec);
 }
 
@@ -133,4 +135,15 @@ export async function setPref(key, value) {
 export async function persist() {
   try { if (navigator.storage && navigator.storage.persist) return await navigator.storage.persist(); } catch (e) { /* ignore */ }
   return false;
+}
+
+/** Can this browser actually save and read back data right now? */
+export async function healthy() {
+  const db = await open();
+  if (!db) return false;
+  try {
+    const v = String(Date.now());
+    await tx(db, 'prefs', 'readwrite', (s) => s.put(v, '__ping'));
+    return (await tx(await open(), 'prefs', 'readonly', (s) => s.get('__ping'))) === v;
+  } catch (e) { console.warn('storage check failed', e); return false; }
 }
