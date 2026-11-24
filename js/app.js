@@ -95,6 +95,9 @@ function friendlyError(e, where = '', ctx = {}) {
     const what = [ctx.sets, ctx.drop].filter(Boolean).join(' / ');
     return `Scryfall didn’t find any cards for “${what}”. Check the set code (like dsk, or dsk,spg) or the drop name.`;
   }
+  if (e.name === 'NotFoundError' || e.name === 'NotReadableError' || /could not be found at the time|could not be read|NotReadable/i.test(msg)) {
+    return 'The app lost access to the video file. Pick the same video again (below), then try again — your cards are kept.';
+  }
   if (/quota|storage|disk/i.test(msg)) return 'Your phone is out of storage space for the app. Free some space (or delete old jobs) and try again.';
   if (/out of memory|allocation|RangeError: Array buffer/i.test(msg)) return 'Your phone ran out of memory. Close other apps and try again, or try a shorter video.';
   if (/codec|decod|demux|unsupported|not supported|moov|ftyp|mp4|container|EncodingError|NotSupportedError/i.test(msg) || e.name === 'NotSupportedError' || e.name === 'EncodingError') {
@@ -106,6 +109,9 @@ function friendlyError(e, where = '', ctx = {}) {
     merge: 'matching what you said', render: 'making the video', drops: 'searching drops' }[where] || 'working';
   return `Something went wrong while ${doing}.`;
 }
+
+const lostFile = (e) => !!e && (e.name === 'NotFoundError' || e.name === 'NotReadableError'
+  || /could not be found at the time|could not be read|NotReadable/i.test(String(e.message || '')));
 
 function errorHTML(e, where, ctx) {
   const m = friendlyError(e, where, ctx);
@@ -882,9 +888,40 @@ async function fillMissingPrices(cards, data, { onProgress, signal } = {}) {
 }
 
 // ------------------------------------------------------------------ scan (ported from the original Python version detect())
+/**
+ * The video for this job, checked readable right now. A File can go stale (Android revokes access to the picked
+ * file, or the working copy was replaced), which only shows up minutes into a scan or render as NotFoundError.
+ * Tries the current File, then a fresh handle on the working copy. Null if neither can be read.
+ */
+async function usableFile() {
+  const readable = async (f) => {
+    await f.slice(0, 64).arrayBuffer();
+    await f.slice(Math.max(0, f.size - 64)).arrayBuffer();
+    return f;
+  };
+  const tries = [() => file, () => (job ? lc.getStaged(job.name, job.size) : null)];
+  for (const get of tries) {
+    const f = await get();
+    if (!f) continue;
+    try { return await readable(f); } catch (e) { console.warn('video not readable', e); }
+  }
+  return null;
+}
+async function needVideo() {
+  const f = await usableFile();
+  if (f && f !== file) setVideo(f);
+  if (!f) {
+    setVideo(null); drawJob();
+    $('repick')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    toast('The app lost access to the video. Pick the same video again — your cards are kept.', 6000);
+  }
+  return !!f;
+}
+
 async function runScan() {
   if (busy || !job) return;
   if (!file) { drawJob(); return toast('Choose the video first.'); }
+  if (!await needVideo()) return;
   const s = job.settings;
   if (!s.sets && !s.drop && !s.pack) return toast('Pick the pack, or enter a set code or Secret Lair drop.');
   const ctrl = startBusy('scan');
@@ -1002,6 +1039,7 @@ async function runScan() {
     toast(job.cards.length ? `Found ${job.cards.length} card${job.cards.length === 1 ? '' : 's'} · saved` : 'No cards found');
   } catch (e) {
     console.error('scan failed', where, e);
+    if (lostFile(e)) setVideo(null);
     clearInterval(crumb);
     if (e?.name === 'AbortError') {
       job.status = job.cards.length ? 'review' : 'new';
@@ -1031,6 +1069,7 @@ async function runRender() {
   if (!o) { $('opts').open = true; $('rtiers').focus(); return toast('Price tiers: up to 4 amounts like 1,5,20,50'); }
   const events = (job.cards || []).filter((c) => c.include !== false).sort((a, b) => a.time_s - b.time_s);
   if (!events.length && !confirm('No cards are included. Make the Short anyway?')) return;
+  if (!await needVideo()) return;
 
   const ctrl = startBusy('render');
   const signal = ctrl.signal;
@@ -1072,6 +1111,7 @@ async function runRender() {
     showResult();
   } catch (e) {
     console.error('render failed', e);
+    if (lostFile(e)) setVideo(null);                  // show "pick the video again" instead of a dead file
     job.status = 'review';
     if (e?.name === 'AbortError') { job.error = null; toast('Cancelled'); } else {
       job.error = friendlyError(e, 'render');
